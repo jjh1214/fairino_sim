@@ -19,7 +19,7 @@
       <minDepth>0.0</minDepth>
     </gazebo>
     <!-- Link1 -->
-    <gazebo reference="link1">
+    <gazebo reference="shoulder_link">
       <turnGravityOff>true</turnGravityOff>
       <kp>0.0</kp>
       <kd>0.0</kd>
@@ -29,7 +29,7 @@
       <minDepth>0.0</minDepth>
     </gazebo>
     <!-- Link2 -->
-    <gazebo reference="link2">
+    <gazebo reference="upperarm_link">
       <turnGravityOff>true</turnGravityOff>
       <kp>0.0</kp>
       <kd>0.0</kd>
@@ -39,7 +39,7 @@
       <minDepth>0.0</minDepth>
     </gazebo>
     <!-- Link3 -->
-    <gazebo reference="link3">
+    <gazebo reference="forearm_link">
       <turnGravityOff>true</turnGravityOff>
       <kp>0.0</kp>
       <kd>0.0</kd>
@@ -49,7 +49,7 @@
       <minDepth>0.0</minDepth>
     </gazebo>
     <!-- Link4 -->
-    <gazebo reference="link4">
+    <gazebo reference="wrist1_link">
       <turnGravityOff>true</turnGravityOff>    
       <kp>0.0</kp>
       <kd>0.0</kd>
@@ -59,7 +59,7 @@
       <minDepth>0.0</minDepth>
     </gazebo>
     <!-- Link5 -->
-    <gazebo reference="link5">
+    <gazebo reference="wrist2_link">
       <turnGravityOff>true</turnGravityOff>    
       <kp>0.0</kp>
       <kd>0.0</kd>
@@ -69,7 +69,7 @@
       <minDepth>0.0</minDepth>
     </gazebo>
     <!-- Link6 -->
-    <gazebo reference="link6">
+    <gazebo reference="wrist3_link">
       <turnGravityOff>true</turnGravityOff>    
       <kp>0.0</kp>
       <kd>0.0</kd>

@@ -1,6 +1,9 @@
-<robot name="fairino5_v6" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<robot name="fairino_cobot" xmlns:xacro="http://www.ros.org/wiki/xacro">
 
-  <xacro:include filename="$(find fairino_description)/urdf/fairino5_v6.urdf" />
+  <xacro:arg name="robot_name" default="fairino5_v6"/>
+  <xacro:property name="model" value="$(arg robot_name)"/>
+
+  <xacro:include filename="$(find fairino_description)/urdf/${model}.urdf" />
   <xacro:include filename="$(find fairino_sim)/config/frcobot_gz.xacro" />
   <xacro:include filename="$(find fairino_sim)/config/frcobot_gz_ros2_control.xacro" />
 
@@ -8,22 +11,9 @@
   <xacro:frcobot_gz_ros2_control />
 
   <link name="world"/>
-  <link name="dummy_link">
-    <inertial>
-      <mass value="0.0001"/>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <inertia ixx="1e-6" ixy="0" ixz="0" iyy="1e-6" iyz="0" izz="1e-6"/>
-    </inertial>
-  </link>
 
-  <joint name="world_to_dummy" type="fixed">
+  <joint name="world_to_base_link" type="fixed">
     <parent link="world"/>
-    <child link="dummy_link"/>
-    <origin xyz="0 0 0" rpy="0 0 0"/>
-  </joint>
-
-  <joint name="dummy_to_base_link" type="fixed">
-    <parent link="dummy_link"/>
     <child link="base_link"/>
     <origin xyz="0 0 0" rpy="0 0 0"/>
   </joint>
