@@ -1,0 +1,24 @@
+# If trying to use launch args is successful, Delet this YAML file.
+controller_manager:
+  ros__parameters:
+    update_rate: 1000  # Hz
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    fairino5_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+fairino5_controller:
+  ros__parameters:
+    joints:
+      - j1
+      - j2
+      - j3
+      - j4
+      - j5
+      - j6
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position

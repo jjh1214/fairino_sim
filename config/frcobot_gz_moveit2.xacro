@@ -1,0 +1,87 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+	<xacro:macro name="frcobot_gz_moveit2" params="namespace:=/">
+  
+    <gazebo>
+      <plugin filename="gz_ros2_control-system" name="gz_ros2_control::GazeboSimROS2ControlPlugin">
+      
+      <!-- TODO: Try using launch args ex)$(find args_name_descpition)config/${args yamlfile name}.yaml -->
+
+
+          <parameters>$(find fairino_sim)/config/frcobot_gz_moveit_controller2.yaml</parameters>
+        </plugin>
+    </gazebo>
+
+    <!-- Base -->
+    <gazebo reference="base_link">
+      <turnGravityOff>true</turnGravityOff>
+      <kp>0.0</kp>
+      <kd>0.0</kd>
+      <mu1>0.0</mu1>
+      <mu2>0.0</mu2>
+      <maxVel>0.0</maxVel>
+      <minDepth>0.0</minDepth>
+    </gazebo>
+    <!-- Link1 -->
+    <gazebo reference="shoulder_link">
+      <turnGravityOff>true</turnGravityOff>
+      <kp>0.0</kp>
+      <kd>0.0</kd>
+      <mu1>0.0</mu1>
+      <mu2>0.0</mu2>
+      <maxVel>0.0</maxVel>
+      <minDepth>0.0</minDepth>
+    </gazebo>
+    <!-- Link2 -->
+    <gazebo reference="upperarm_link">
+      <turnGravityOff>true</turnGravityOff>
+      <kp>0.0</kp>
+      <kd>0.0</kd>
+      <mu1>0.0</mu1>
+      <mu2>0.0</mu2>
+      <maxVel>0.0</maxVel>
+      <minDepth>0.0</minDepth>
+    </gazebo>
+    <!-- Link3 -->
+    <gazebo reference="forearm_link">
+      <turnGravityOff>true</turnGravityOff>
+      <kp>0.0</kp>
+      <kd>0.0</kd>
+      <mu1>0.0</mu1>
+      <mu2>0.0</mu2>
+      <maxVel>0.0</maxVel>
+      <minDepth>0.0</minDepth>
+    </gazebo>
+    <!-- Link4 -->
+    <gazebo reference="wrist1_link">
+      <turnGravityOff>true</turnGravityOff>    
+      <kp>0.0</kp>
+      <kd>0.0</kd>
+      <mu1>0.0</mu1>
+      <mu2>0.0</mu2>
+      <maxVel>0.0</maxVel>
+      <minDepth>0.0</minDepth>
+    </gazebo>
+    <!-- Link5 -->
+    <gazebo reference="wrist2_link">
+      <turnGravityOff>true</turnGravityOff>    
+      <kp>0.0</kp>
+      <kd>0.0</kd>
+      <mu1>0.0</mu1>
+      <mu2>0.0</mu2>
+      <maxVel>0.0</maxVel>
+      <minDepth>0.0</minDepth>
+    </gazebo>
+    <!-- Link6 -->
+    <gazebo reference="wrist3_link">
+      <turnGravityOff>true</turnGravityOff>    
+      <kp>0.0</kp>
+      <kd>0.0</kd>
+      <mu1>0.0</mu1>
+      <mu2>0.0</mu2>
+      <maxVel>0.0</maxVel>
+      <minDepth>0.0</minDepth>
+    </gazebo>
+
+	</xacro:macro>
+</robot>
