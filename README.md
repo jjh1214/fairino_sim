@@ -28,3 +28,26 @@ $ source fairino_ws/install/local_setup.bash
 ### if you want
 # $ echo 'source ~/fairino_ws/install/local_setup.bash' >> ~/.bashrc 
 ```
+
+# Launch
+## Default Model : fairino5_v6
+```
+ros2 launch fairino_sim fairino_gz.launch.py
+```
+## Other Models
+### *NOTE : fairino3_mt_v6 is not supported.*
+```
+ros2 launch fairino_sim fairino_gz.launch.py robot_name:=fairino3_v6
+ros2 launch fairino_sim fairino_gz.launch.py robot_name:=fairino10_v6
+ros2 launch fairino_sim fairino_gz.launch.py robot_name:=fairino16_v6
+ros2 launch fairino_sim fairino_gz.launch.py robot_name:=fairino20_v6
+ros2 launch fairino_sim fairino_gz.launch.py robot_name:=fairino30_v6
+
+```
+
+# Move Model
+```
+ros2 topic pub -1 /frcobot_position_controller/commands std_msgs/msg/Float64MultiArray "{data: [2.0, -1.571, -1.571, -1.571, -1.571, -1.571]}"
+
+ros2 topic pub -1 /frcobot_position_controller/commands std_msgs/msg/Float64MultiArray "{data: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}"
+```
