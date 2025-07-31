@@ -29,7 +29,7 @@ $ source fairino_ws/install/local_setup.bash
 # $ echo 'source ~/fairino_ws/install/local_setup.bash' >> ~/.bashrc 
 ```
 
-# Launch
+# GZ Launch
 ## Default Model : fairino5_v6
 ```
 ros2 launch fairino_sim fairino_gz.launch.py
@@ -51,3 +51,31 @@ ros2 topic pub -1 /frcobot_position_controller/commands std_msgs/msg/Float64Mult
 
 ros2 topic pub -1 /frcobot_position_controller/commands std_msgs/msg/Float64MultiArray "{data: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}"
 ```
+# Move example
+
+[Screencast from 2025-07-31 09-28-38.webm](https://github.com/user-attachments/assets/c4b7654f-bd6c-4130-88a2-4ee26a23a3ae)
+
+# GZ with Moveit Launch
+## Default Model : fairino5_v6
+```
+ros2 launch fairino_sim fairino_gz_moveit2.launch.py
+```
+## Other Models
+### *NOTE : fairino3_mt_v6 is not supported.*
+```
+ros2 launch fairino_sim fairino_gz_moveit2.launch.py robot_name:=fairino3_v6
+
+ros2 launch fairino_sim fairino_gz_moveit2.launch.py robot_name:=fairino10_v6
+
+ros2 launch fairino_sim fairino_gz_moveit2.launch.py robot_name:=fairino16_v6
+
+ros2 launch fairino_sim fairino_gz_moveit2.launch.py robot_name:=fairino20_v6
+
+ros2 launch fairino_sim fairino_gz_moveit2.launch.py robot_name:=fairino30_v6
+
+```
+
+# Move example
+
+[Screencast from 2025-07-31 09-30-59.webm](https://github.com/user-attachments/assets/f1d53846-4953-4821-be4b-f542406576af)
+
