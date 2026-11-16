@@ -97,7 +97,7 @@ def _format(vector):
     return ' '.join(repr(float(v)) for v in vector)
 
 
-def _pose(data, what):
+def parse_pose(data, what):
     """Read {xyz: [m], rpy: [rad]} or {xyz, rpy_deg: [deg]} into (xyz, rpy) tuples."""
     if data is None:
         return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
@@ -167,8 +167,8 @@ def load_tool(path):
     visual = _mesh_path(base_dir, mesh['visual'], path)
     collision = _mesh_path(base_dir, mesh.get('collision', mesh['visual']), path)
 
-    mount_xyz, mount_rpy = _pose(data.get('mount'), 'mount')
-    tcp_xyz, tcp_rpy = _pose(data.get('tcp'), 'tcp')
+    mount_xyz, mount_rpy = parse_pose(data.get('mount'), 'mount')
+    tcp_xyz, tcp_rpy = parse_pose(data.get('tcp'), 'tcp')
     try:
         mass = float(data.get('mass', 0.5))
     except (TypeError, ValueError):

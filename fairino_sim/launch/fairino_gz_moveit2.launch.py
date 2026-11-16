@@ -82,13 +82,15 @@ def launch_setup(context):
         executable='move_group',
         output='screen',
         parameters=[moveit_config.to_dict(), use_sim_time])]
+    rviz_config = LaunchConfiguration('rviz_config').perform(context) or os.path.join(
+        moveit_share, 'config', 'moveit.rviz')
     if use_rviz:
         moveit_nodes.append(Node(
             package='rviz2',
             executable='rviz2',
             name='rviz2',
             output='log',
-            arguments=['-d', os.path.join(moveit_share, 'config', 'moveit.rviz')],
+            arguments=['-d', rviz_config],
             parameters=[
                 moveit_config.robot_description,
                 moveit_config.robot_description_semantic,
@@ -113,6 +115,9 @@ def generate_launch_description():
     return LaunchDescription(
         launch_common.declare_robot_arguments()
         + [DeclareLaunchArgument('use_rviz', default_value='true',
-                                 description='Start RViz with the MoveIt plugin')]
+                                 description='Start RViz with the MoveIt plugin'),
+           DeclareLaunchArgument('rviz_config', default_value='',
+                                 description='RViz config file (default: moveit.rviz of the '
+                                             'MoveIt config package)')]
         + launch_common.gazebo_actions()
         + [OpaqueFunction(function=launch_setup)])
