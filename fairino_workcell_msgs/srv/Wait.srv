@@ -1,0 +1,11 @@
+# Wait for a time, or until a virtual IO has a value. Parts on running conveyors keep moving
+# and are checked for collisions with the waiting robot. In a check session the conveyors run
+# in virtual time; IO set by other programs is assumed to have the value at once.
+string io         # empty: wait for 'seconds'
+bool value
+float64 seconds   # time to wait; with io: timeout, 0 = no timeout
+bool check_only   # wait in the check session only (virtual time)
+string name       # step name for the report
+---
+bool success
+StepReport report

@@ -10,6 +10,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/StepReport.msg"
   "srv/Gripper.srv"
   "srv/SetIO.srv"
+  "srv/Wait.srv"
   "action/Move.action"
   DEPENDENCIES geometry_msgs
 )

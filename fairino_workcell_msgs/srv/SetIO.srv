@@ -1,6 +1,9 @@
-# Set a virtual digital output of the work cell (published on /workcell/io).
-string name
+# Set a virtual digital IO of the work cell (published on /workcell/io): an output of the
+# recipe, or a signal from another program. Conveyor sensor signals cannot be set.
+string io
 bool value
+bool check_only   # apply to the check session only; the simulation is not changed
+string name       # step name for the report
 ---
 bool success
-string message
+StepReport report
