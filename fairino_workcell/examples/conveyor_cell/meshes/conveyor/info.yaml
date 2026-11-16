@@ -1,0 +1,23 @@
+source: ../../cad/conveyor.step
+source_units: from the STEP file
+origin: keep
+origin_offset_m:
+- 0.0
+- 0.0
+- 0.0
+size_m:
+- 2.1
+- 0.44
+- 0.84
+bounds_m:
+  min:
+  - -1.05
+  - -0.22
+  - 0.0
+  max:
+  - 1.05
+  - 0.22
+  - 0.84
+visual_faces: 1860
+collision: mesh
+collision_faces: 1860

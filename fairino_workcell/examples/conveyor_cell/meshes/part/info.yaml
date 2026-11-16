@@ -1,0 +1,23 @@
+source: ../../cad/part.step
+source_units: from the STEP file
+origin: keep
+origin_offset_m:
+- 0.0
+- 0.0
+- 0.0
+size_m:
+- 0.12
+- 0.08
+- 0.06
+bounds_m:
+  min:
+  - -0.06
+  - -0.04
+  - 0.0
+  max:
+  - 0.06
+  - 0.04
+  - 0.06
+visual_faces: 380
+collision: mesh
+collision_faces: 380

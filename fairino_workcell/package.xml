@@ -7,9 +7,23 @@
   <maintainer email="scarlet777735@gmail.com">axbis-jhjung</maintainer>
   <license>MIT</license>
 
-  <exec_depend>fairino_workcell_msgs</exec_depend>
   <exec_depend>fairino_sim</exec_depend>
+  <exec_depend>fairino_workcell_msgs</exec_depend>
+
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>gz_msgs_vendor</exec_depend>
+  <exec_depend>gz_transport_vendor</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>moveit_msgs</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
   <exec_depend>rclpy</exec_depend>
+  <exec_depend>shape_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>tf2_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

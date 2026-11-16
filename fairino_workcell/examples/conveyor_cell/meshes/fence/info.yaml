@@ -1,0 +1,23 @@
+source: ../../cad/fence.obj
+source_units: mm
+origin: keep
+origin_offset_m:
+- 0.0
+- 0.0
+- 0.0
+size_m:
+- 0.04
+- 1.54
+- 1.8
+bounds_m:
+  min:
+  - -0.02
+  - -0.77
+  - 0.0
+  max:
+  - 0.02
+  - 0.77
+  - 1.8
+visual_faces: 60
+collision: mesh
+collision_faces: 60

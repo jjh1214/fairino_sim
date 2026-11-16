@@ -1,0 +1,52 @@
+# Example work cell: a fairino5 on a pedestal next to a belt conveyor and a table.
+# The meshes were made from cad/ with import_cad (see cad/generate_cad.py):
+#   import_cad cad/conveyor.step cad/part.step --out meshes
+#   import_cad cad/table.stl cad/fence.obj --units mm --out meshes
+cell: conveyor_cell
+
+robot:
+  model: fairino5_v6
+  base: {xyz: [0.0, 0.0, 0.75]}             # base_link on top of the pedestal
+  initial_positions_deg: [0, -90, 0, 0, 0, 0]
+  tool: example_gripper                     # a tool of fairino_sim/tools, or a tool YAML path
+
+objects:
+  - name: pedestal
+    box: [0.30, 0.30, 0.75]                 # boxes and cylinders are centred on their pose
+    pose: {xyz: [0.0, 0.0, 0.375]}
+    color: [0.25, 0.27, 0.30, 1.0]
+    touch_links: [base_link]                # the robot stands on it
+
+  - name: conveyor
+    visual: meshes/conveyor/visual.glb
+    collision: meshes/conveyor/collision.stl
+    units: m
+    pose: {xyz: [0.0, -0.60, 0.0]}
+    color: [0.36, 0.40, 0.45, 1.0]
+    frames:
+      station: {xyz: [0.0, 0.0, 0.80]}      # where parts stop, on the belt surface
+
+  - name: part
+    visual: meshes/part/visual.glb
+    collision: meshes/part/collision.stl
+    units: m
+    pose: {xyz: [0.0, -0.60, 0.80]}         # resting at the conveyor station
+    color: [0.90, 0.45, 0.12, 1.0]
+    frames:
+      grasp: {xyz: [0.0, 0.0, 0.03]}
+
+  - name: table
+    visual: meshes/table/visual.glb
+    collision: meshes/table/collision.stl
+    units: m
+    pose: {xyz: [0.55, 0.30, 0.0]}
+    color: [0.58, 0.44, 0.30, 1.0]
+    frames:
+      place: {xyz: [0.0, 0.0, 0.75]}
+
+  - name: fence
+    visual: meshes/fence/visual.glb
+    collision: meshes/fence/collision.stl
+    units: m
+    pose: {xyz: [-0.70, 0.0, 0.0]}
+    color: [0.92, 0.78, 0.10, 1.0]

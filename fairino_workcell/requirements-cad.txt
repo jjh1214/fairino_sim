@@ -1,0 +1,9 @@
+# Dependencies of the import_cad tool (not needed at simulation runtime).
+#   python3 -m venv ~/fairino_cad_venv --system-site-packages
+#   ~/fairino_cad_venv/bin/pip install -r requirements-cad.txt
+trimesh>=4.5
+cascadio>=0.1           # STEP files, through OpenCASCADE
+fast-simplification>=0.1  # collision mesh simplification
+scipy                   # convex hulls
+numpy
+pyyaml

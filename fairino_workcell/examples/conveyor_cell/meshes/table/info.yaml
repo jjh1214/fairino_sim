@@ -1,0 +1,23 @@
+source: ../../cad/table.stl
+source_units: mm
+origin: keep
+origin_offset_m:
+- 0.0
+- 0.0
+- 0.0
+size_m:
+- 0.6
+- 0.6
+- 0.75
+bounds_m:
+  min:
+  - -0.3
+  - -0.3
+  - 0.0
+  max:
+  - 0.3
+  - 0.3
+  - 0.75
+visual_faces: 60
+collision: mesh
+collision_faces: 60

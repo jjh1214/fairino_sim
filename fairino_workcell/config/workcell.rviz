@@ -1,0 +1,72 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /MotionPlanning1
+  - Class: rviz_common/Help
+    Name: Help
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Reference Frame: world
+      Plane Cell Count: 16
+      Cell Size: 0.25
+      Value: true
+    - Class: moveit_rviz_plugin/MotionPlanning
+      Name: MotionPlanning
+      Planned Path:
+        Loop Animation: true
+        State Display Time: 0.05 s
+        Trajectory Topic: display_planned_path
+      Planning Scene Topic: monitored_planning_scene
+      Robot Description: robot_description
+      Scene Geometry:
+        Scene Alpha: 0.35
+      Scene Robot:
+        Robot Alpha: 1
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Workcell (visual meshes)
+      Namespaces:
+        workcell: true
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /workcell/markers
+      Value: true
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Show Names: true
+      Show Axes: true
+      Show Arrows: false
+      Marker Scale: 0.3
+      Value: false
+  Global Options:
+    Fixed Frame: world
+    Background Color: 48; 48; 52
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 3.6
+      Focal Point:
+        X: 0.1
+        Y: -0.1
+        Z: 0.6
+      Name: Current View
+      Pitch: 0.45
+      Target Frame: world
+      Yaw: 5.55
+Window Geometry:
+  Height: 975
+  Width: 1400
