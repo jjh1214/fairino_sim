@@ -142,8 +142,8 @@ reachability, joint limits and collisions before it runs (see [Recipes](#recipes
 ```
 ros2 launch fairino_workcell fairino_workcell.launch.py
 ```
-A fairino5_v6 with the example gripper on a pedestal, next to a belt conveyor (with a part at its
-stop position), a table and a safety fence.
+A fairino5_v6 with the example gripper on a pedestal, next to a belt conveyor that brings four
+parts to its station, a table and a safety fence.
 
 | Argument | Default | Description |
 |---|---|---|
@@ -165,6 +165,13 @@ robot:
   base: {xyz: [0.0, 0.0, 0.75]}                 # pose of base_link in the world frame
   initial_positions_deg: [0, -90, 0, 0, 0, 0]   # or initial_positions in radians
   tool: example_gripper                         # tool name, or tool YAML path relative to this file
+parts:                                          # part types that conveyors bring (optional)
+  - name: part                                  # the parts are named part_1, part_2, ...
+    visual: meshes/part/visual.glb
+    collision: meshes/part/collision.stl
+    units: m
+    frames:
+      grasp: {xyz: [0.0, 0.0, 0.03]}            # where the TCP must be to grip it
 objects:
   - name: conveyor                              # letters, digits and _
     visual: meshes/conveyor/visual.glb          # GLB, DAE, OBJ or STL, relative to this file
@@ -173,24 +180,39 @@ objects:
     pose: {xyz: [0.0, -0.6, 0.0], rpy_deg: [0, 0, 90]}   # in the world frame; or rpy in radians
     color: [0.36, 0.40, 0.45, 1.0]              # optional
     frames:                                     # optional named frames on the object
+      entry: {xyz: [-0.75, 0.0, 0.80]}
       station: {xyz: [0.0, 0.0, 0.80]}
-  - name: part
-    visual: meshes/part/visual.glb
-    units: m
-    pose: {xyz: [0.0, -0.6, 0.80]}
-    movable: true                               # recipes can grip and move it
-    frames:
-      grasp: {xyz: [0.0, 0.0, 0.03]}            # where the TCP must be to grip it
+    conveyor:                                   # optional: an index conveyor (see below)
+      part: part                                # part type it brings
+      entry: entry                              # frame where parts are put on the belt
+      station: station                          # frame where parts stop
+      speed: 0.15                               # m/s
+      spacing: 0.30                             # m between parts on the belt
+      count: 4                                  # parts to bring; 0 or omitted: no limit
   - name: pedestal
     box: [0.30, 0.30, 0.75]                     # or cylinder: {radius: r, length: l}, in metres,
     pose: {xyz: [0.0, 0.0, 0.375]}              # centred on the pose
     touch_links: [base_link]                    # robot links allowed to touch this object
+  - name: fixture_part                          # an object can also be a part itself:
+    box: [0.1, 0.1, 0.05]
+    pose: {xyz: [0.5, 0.3, 0.775]}
+    movable: true                               # recipes can grip and move it
+    frames:
+      grasp: {xyz: [0.0, 0.0, 0.0]}
 ```
 Each object is a TF frame named after it, and each named frame is `<object>/<frame>`
-(for example `conveyor/station`), also available as a MoveIt subframe. Movable objects follow the
-gripper when a recipe grips them; the other objects stay where the cell file puts them.
+(for example `conveyor/station`), also available as a MoveIt subframe. The parts that conveyors
+bring are frames too (`part_1`, `part_1/grasp`). Movable objects and parts follow the gripper
+when a recipe grips them; the other objects stay where the cell file puts them.
 In Gazebo the objects are visual only: the executor checks collisions itself, so Gazebo physics
 never stops the robot at a contact that a step allows (fingers around a part, a part set down).
+
+### Index conveyors
+A conveyor puts a part on its belt at the `entry` frame, then one every `spacing` metres of belt
+travel. The parts travel in a straight line to the `station` frame and stop there; the belt
+stands still while a part waits at the station, and the IO `<conveyor>/part_ready` (for example
+`conveyor/part_ready`) is true. When the robot grips that part, the belt runs again and brings
+the next one. The conveyors start with the simulation; `--reset` (see below) puts the parts back.
 
 ## Importing CAD files
 `import_cad` converts STEP, STL and OBJ files into a visual mesh (GLB) and a simplified collision
@@ -211,73 +233,103 @@ It prints the entries to paste into the cell file. Options: `--origin keep|cente
 
 # Recipes
 A recipe is a Python function that receives the cell. Steps take joint angles (degrees, as on the
-teach pendant) or TCP poses in a cell frame:
+teach pendant) or TCP poses in a cell frame, and can wait for IO such as conveyor sensors:
 ```python
 HOME = [-45, -90, -90, -90, 90, 0]
 
 def recipe(cell):
     cell.move_joints(HOME, name='home')
-    cell.move_to('part/grasp', xyz=(0, 0, 0.15), rpy_deg=(180, 0, 180), name='above part')
-    cell.move_to('part/grasp', rpy_deg=(180, 0, 180), speed=0.1, allow_contact=['part'], name='pick')
+    cell.move_to('conveyor/station', xyz=(0, 0, 0.18), rpy_deg=(180, 0, 180), name='above station')
+    cell.wait_io('conveyor/part_ready', name='wait for part')
+    cell.move_to('conveyor/station', xyz=(0, 0, 0.03), rpy_deg=(180, 0, 180), speed=0.1,
+                 allow_contact=['part'], name='pick')
     cell.grip(name='grip')
     ...
 ```
-The complete example is [`examples/conveyor_cell/pick_and_place.py`](fairino_workcell/examples/conveyor_cell/pick_and_place.py):
-it picks the part at the conveyor station and places it on the table. Start the cell:
+The examples in [`examples/conveyor_cell`](fairino_workcell/examples/conveyor_cell):
+- [`pick_and_place.py`](fairino_workcell/examples/conveyor_cell/pick_and_place.py): wait for the
+  first part at the conveyor station and place it on the table;
+- [`index_cycle.py`](fairino_workcell/examples/conveyor_cell/index_cycle.py): take the four parts
+  the conveyor brings, one after the other, and place them on the table in a 2 x 2 pattern.
+
+Start the cell:
 ```
 ros2 launch fairino_workcell fairino_workcell.launch.py
 ```
 Then, in another terminal:
 ```
 cd ~/fairino_ws/src/fairino_sim/fairino_workcell/examples/conveyor_cell
-ros2 run fairino_workcell run_recipe pick_and_place.py --check    # check only: nothing moves
-ros2 run fairino_workcell run_recipe pick_and_place.py            # run in the simulation
+ros2 run fairino_workcell run_recipe index_cycle.py --reset --check   # check only: nothing moves
+ros2 run fairino_workcell run_recipe index_cycle.py                   # run in the simulation
 ```
+`--reset` first puts the cell back to its start: the robot stays where it is, objects and parts
+go back, and the conveyors wait for the next run. So a check from a reset and the run after it
+start from the same state, and the run follows the timeline of the check.
 A recipe can also be checked without ROS or the simulation, for example in automated tests:
 ```
-ros2 run fairino_workcell run_recipe pick_and_place.py --offline cell.yaml
+ros2 run fairino_workcell run_recipe index_cycle.py --offline cell.yaml
 ```
 `--report report.json` saves the report and `--keep-going` continues after a failed step.
-Every run prints a report:
+Every run prints a report, a line for each step as it finishes:
 ```
-  #  step            kind     result      time  clearance  closest                   message
-  1  home            move     OK         2.71s      94 mm  upperarm_link / pedestal  path is free
-  2  above part      move     OK         1.65s      94 mm  upperarm_link / pedestal  path is free
-  3  pick            move     OK         2.20s      25 mm  tool_link / conveyor      path is free
-  4  grip            grip     OK         0.00s          -                            gripped part, TCP 0.0 mm from part/grasp, lifting it from conveyor
+  #  step               kind     result      time  clearance  closest                   message
+  1  home               move     OK         2.71s      94 mm  upperarm_link / pedestal  path is free
+  2  1: above station   move     OK         1.65s      94 mm  upperarm_link / pedestal  path is free
+  3  1: wait for part   wait     OK         0.64s      94 mm  upperarm_link / pedestal  conveyor/part_ready = true after 0.64 s
+  4  1: pick            move     OK         2.20s      25 mm  tool_link / conveyor      path is free
+  5  1: grip            grip     OK         0.00s          -                            gripped part_1, TCP 0.0 mm from part_1/grasp, lifting it from conveyor
+  6  1: lift            move     OK         1.27s      25 mm  tool_link / conveyor      path is free
+  7  1: above table     move     OK         3.20s      85 mm  part_1 / part_2           path is free
 ...
-Cycle time 17.03 s | 10 steps: 10 OK, 0 warnings, 0 failed
+Cycle time 57.69 s | 38 steps: 38 OK, 0 warnings, 0 failed | waiting 0.64 s | 4 parts gripped, one every 13.39 s
 ```
 
 | Step | Description |
 |---|---|
 | `move_joints(joints, degrees=True, speed=None, name=None, allow_contact=())` | PTP move to joint angles j1..j6 |
-| `move_to(frame, xyz=(0, 0, 0), rpy_deg=(180, 0, 0), ...)` | PTP move of the TCP to a pose in `world`, an object or `object/frame`; the default orientation points the tool down onto the frame |
+| `move_to(frame, xyz=(0, 0, 0), rpy_deg=(180, 0, 0), ...)` | PTP move of the TCP to a pose in `world`, an object, a part or `object/frame`; the default orientation points the tool down onto the frame |
 | `move_pose(pose, ...)` | PTP move of the TCP to a `geometry_msgs/PoseStamped` |
-| `grip(name=None)` | Grip the movable object whose `grasp` frame is at the TCP (within 10 mm) |
+| `grip(name=None)` | Grip the movable object or part whose `grasp` frame is at the TCP (within 10 mm) |
 | `release(name=None)` | Leave the held object where it is |
-| `set_io(name, value)`, `wait_io(name, value=True, timeout=None)` | Virtual digital IO (skipped in check runs) |
-| `wait(seconds)` | Wait; counted in the cycle time |
+| `wait_io(io, value=True, timeout=None, name=None)` | Wait until a virtual IO has the value; a timeout (s) fails the step |
+| `wait(seconds, name=None)` | Wait for a time |
+| `set_io(io, value, name=None)` | Set a virtual IO, for example an output to another machine |
 
-`speed` is a fraction of the joint velocity and acceleration limits (default 0.3). A failed step
-raises `RecipeError` and stops the recipe.
+`speed` is a fraction of the joint velocity and acceleration limits (default 0.3).
+`allow_contact` takes object names, part names (`part_3`) or part types (`part`: all its parts).
+A failed step raises `RecipeError` and stops the recipe.
 
 ## What is checked
 - **Reachability and joint limits.** A pose target is solved like on the robot controller: the
   joint solution nearest to the current joints, so the arm configuration (shoulder, elbow, wrist)
   follows from the previous step and a check gives the same joints as the run.
 - **Collisions along the whole path** of the robot, the tool and the held object, with the cell
-  objects and with themselves (every 0.5 degrees of joint motion). The report names the colliding
+  objects, the parts and themselves (every 0.5 degrees of joint motion). Parts on a running
+  conveyor are checked where they are at each moment of the move. The report names the colliding
   pair (for example `tool_link <-> table`) and where on the path it happens; the move is not done.
-- **Clearance**: the smallest distance to the cell along the path and the closest pair. Below
-  10 mm the step is a warning.
+- **Waits**: parts that move while the robot waits are checked against it too, for example a part
+  that arrives at the station while the gripper is already down there.
+- **Clearance**: the smallest distance to the cell and the parts along the path, and the closest
+  pair. Below 10 mm the step is a warning.
 - **Contacts**: a step can allow contact of the tool and the held object with named objects
   (`allow_contact=['part']` while closing the fingers around the part). After `grip`, the next move
   may lift the part off its support; after `release`, the next move may take the tool away from it.
-- **Cycle time** from the PTP profiles (trapezoidal joint velocities).
+- **Times**: the duration of every move (trapezoidal joint velocity profiles) and every wait, the
+  cycle time, the time spent waiting and how often a part is gripped.
+
+## Cell time
+In a check, the conveyors run in virtual time: a move lets them run for its duration, a wait
+until the IO has the value. `wait_io` on a conveyor sensor therefore knows how long the robot
+waits, and fails if the part never comes (`conveyor/part_ready will not become true: conveyor
+conveyor has no more parts`). IO that other programs set (vision, PLC) is assumed in a check.
+
+In the simulation, the conveyors run in simulation time. During a recipe run they only run while
+a step takes time, like on a robot controller where checking a step and the gaps between steps
+take no time; so the run follows the timeline of its check. Outside runs they run freely.
 
 RViz shows the TCP path of every step (green: OK, orange: warning, red: collision, with a red
-sphere where it collides) on the `/workcell/check_markers` topic.
+sphere where it collides) on the `/workcell/check_markers` topic, and the parts on
+`/workcell/part_markers`.
 
 ## Interfaces
 The recipe API only uses these ROS interfaces (`fairino_workcell_msgs`), so other programs
@@ -287,12 +339,16 @@ The recipe API only uses these ROS interfaces (`fairino_workcell_msgs`), so othe
 |---|---|---|
 | `/workcell/move` | action `Move` | Joint or pose target, speed, allowed contacts, `check_only`; result and feedback |
 | `/workcell/gripper` | service `Gripper` | Grip (`close: true`) or release |
-| `/workcell/set_io` | service `SetIO` | Set a virtual digital IO |
+| `/workcell/wait` | service `Wait` | Wait for a time or for an IO value |
+| `/workcell/set_io` | service `SetIO` | Set a virtual IO (conveyor sensors cannot be set) |
 | `/workcell/check/begin` | service `std_srvs/Trigger` | Start a check session from the current state |
 | `/workcell/run/begin` | service `std_srvs/Trigger` | Start a recipe run (clears the step markers) |
-| `/workcell/io` | topic `IOState` | Virtual IO values (latched) |
+| `/workcell/run/end` | service `std_srvs/Trigger` | End the run: the conveyors run freely again |
+| `/workcell/reset` | service `std_srvs/Trigger` | Put objects, parts and conveyors back to the start |
+| `/workcell/io` | topic `IOState` | Virtual IO values, conveyor sensors included (latched) |
 | `/workcell/step_report` | topic `StepReport` | Report of every step |
 | `/workcell/check_markers` | topic `visualization_msgs/MarkerArray` | TCP paths of the steps |
+| `/workcell/part_markers` | topic `visualization_msgs/MarkerArray` | Parts brought by conveyors |
 
 Check-only steps run in a check session: a copy of the cell state that the steps update (the
 robot stays where it is), so a whole recipe can be checked before it runs.
