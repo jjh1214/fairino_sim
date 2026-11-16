@@ -5,6 +5,7 @@ from xml.sax.saxutils import escape
 
 from fairino_workcell.cell import frame_id, WORLD_FRAME
 from fairino_workcell.meshes import read_stl
+from fairino_workcell.motion import matrix_quaternion
 from geometry_msgs.msg import Point, Pose, TransformStamped
 from moveit_msgs.msg import AllowedCollisionEntry, CollisionObject, ObjectColor
 from shape_msgs.msg import Mesh, MeshTriangle, SolidPrimitive
@@ -51,14 +52,35 @@ def _transform(parent, child, pose, stamp):
     return msg
 
 
-def static_transforms(cell, stamp):
-    """Return world -> object and object -> object/frame transforms for every cell object."""
+def static_transforms(cell, stamp, include_movable=True):
+    """Return world -> object and object -> object/frame transforms of the cell objects."""
     transforms = []
     for obj in cell.objects:
+        if obj.movable and not include_movable:
+            continue
         transforms.append(_transform(WORLD_FRAME, obj.name, obj.pose, stamp))
-        for name, pose in obj.frames:
-            transforms.append(_transform(obj.name, frame_id(obj.name, name), pose, stamp))
+        transforms.extend(frame_transforms(obj, stamp))
     return transforms
+
+
+def frame_transforms(obj, stamp):
+    """Return the object -> object/frame transforms of one object."""
+    return [_transform(obj.name, frame_id(obj.name, name), pose, stamp)
+            for name, pose in obj.frames]
+
+
+def transform_msg(parent, child, matrix, stamp):
+    """Return a TransformStamped for a 4x4 transform."""
+    msg = TransformStamped()
+    msg.header.stamp = stamp
+    msg.header.frame_id = parent
+    msg.child_frame_id = child
+    msg.transform.translation.x, msg.transform.translation.y, msg.transform.translation.z = (
+        float(v) for v in matrix[:3, 3])
+    x, y, z, w = matrix_quaternion(matrix[:3, :3])
+    msg.transform.rotation.x, msg.transform.rotation.y = x, y
+    msg.transform.rotation.z, msg.transform.rotation.w = z, w
+    return msg
 
 
 def collision_object(obj):
@@ -151,7 +173,13 @@ def _uses_cell_color(obj):
 
 
 def gazebo_sdf(obj):
-    """Return the SDF of a static Gazebo model for a cell object."""
+    """
+    Return the SDF of a static Gazebo model for a cell object.
+
+    The model is visual only: workcell_executor checks collisions and places the movable
+    objects itself, so Gazebo physics must not stop the robot at contacts that a step allows
+    (fingers around a part, a part set down on a table).
+    """
     x, y, z = obj.pose.xyz
     roll, pitch, yaw = obj.pose.rpy
     material = ''
@@ -167,8 +195,6 @@ def gazebo_sdf(obj):
         '    <link name="link">\n'
         f'      <visual name="visual"><geometry>{_sdf_geometry(obj.geometry, obj.geometry.visual)}'
         f'</geometry>{material}</visual>\n'
-        '      <collision name="collision"><geometry>'
-        f'{_sdf_geometry(obj.geometry, obj.geometry.collision)}</geometry></collision>\n'
         '    </link>\n'
         '  </model>\n'
         '</sdf>\n')
@@ -182,11 +208,12 @@ def markers(cell, namespace='workcell'):
     array.markers.append(clear)
     for index, obj in enumerate(cell.objects):
         marker = Marker()
-        marker.header.frame_id = WORLD_FRAME
+        marker.header.frame_id = obj.name   # follows the object when it moves
+        marker.frame_locked = True
         marker.ns = namespace
         marker.id = index
         marker.action = Marker.ADD
-        marker.pose = pose_msg(obj.pose)
+        marker.pose = _identity()
         marker.color = _rgba(obj.color)
         geometry = obj.geometry
         if geometry.kind == 'mesh':

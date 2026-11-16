@@ -34,7 +34,9 @@ def test_example_cell():
     assert conveyor.geometry.has_embedded_materials and conveyor.color_given
     assert 'conveyor/station' in cell.frame_names()
     assert cell.objects[0].geometry.size == (0.3, 0.3, 0.75)
-    assert cell.objects[0].touch_links == ('base_link',)
+    assert cell.objects[0].touch_links == ('base_link', 'shoulder_link')
+    assert cell.objects[2].movable and not cell.objects[1].movable
+    assert cell.objects[2].frame('grasp').xyz == (0.0, 0.0, 0.03)
 
 
 def test_shapes_units_and_defaults(tmp_path):
@@ -87,6 +89,7 @@ def test_tool_path_is_relative_to_the_cell_file(tmp_path):
     (None, '  - {name: a, cylinder: {radius: 1}}\n', 'cylinder must be'),
     (None, '  - {name: a, box: [1, 1, 1], units: mm}\n', 'units only applies to meshes'),
     (None, '  - {name: a, box: [1, 1, 1], pose: {xyz: [0, 0]}}\n', 'pose.xyz must be 3'),
+    (None, '  - {name: a, box: [1, 1, 1], movable: 1}\n', 'movable must be true or false'),
 ])
 def test_invalid_cells_raise_clear_errors(tmp_path, robot, objects, message):
     if robot is None:

@@ -107,10 +107,11 @@ def test_gazebo_sdf_and_markers():
     model = ET.fromstring(scene.gazebo_sdf(conveyor)).find('model')
     assert model.get('name') == 'conveyor' and model.find('static').text == 'true'
     uris = [uri.text for uri in model.iter('uri')]
-    assert uris[0].endswith('visual.glb') and uris[1].endswith('collision.stl')
+    assert len(uris) == 1 and uris[0].endswith('visual.glb')
+    assert model.find('link/collision') is None     # no Gazebo contacts: the executor checks
     assert model.find('link/visual/material') is not None  # colour given in the cell file
     pedestal = ET.fromstring(scene.gazebo_sdf(cell.objects[0])).find('model')
-    assert pedestal.find('link/collision/geometry/box/size').text == '0.3 0.3 0.75'
+    assert pedestal.find('link/visual/geometry/box/size').text == '0.3 0.3 0.75'
 
     array = scene.markers(cell)
     assert array.markers[0].action == Marker.DELETEALL

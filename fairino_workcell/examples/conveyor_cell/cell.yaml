@@ -15,7 +15,7 @@ objects:
     box: [0.30, 0.30, 0.75]                 # boxes and cylinders are centred on their pose
     pose: {xyz: [0.0, 0.0, 0.375]}
     color: [0.25, 0.27, 0.30, 1.0]
-    touch_links: [base_link]                # the robot stands on it
+    touch_links: [base_link, shoulder_link] # the robot stands on it; the shoulder only turns above it
 
   - name: conveyor
     visual: meshes/conveyor/visual.glb
@@ -32,8 +32,9 @@ objects:
     units: m
     pose: {xyz: [0.0, -0.60, 0.80]}         # resting at the conveyor station
     color: [0.90, 0.45, 0.12, 1.0]
+    movable: true                           # can be gripped and moved by the robot
     frames:
-      grasp: {xyz: [0.0, 0.0, 0.03]}
+      grasp: {xyz: [0.0, 0.0, 0.03]}        # TCP position when gripping the part
 
   - name: table
     visual: meshes/table/visual.glb

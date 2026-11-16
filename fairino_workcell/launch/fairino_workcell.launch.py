@@ -5,6 +5,7 @@ Simulate a FAIRINO work cell: the robot from fairino_sim plus the equipment of a
 
 The cell file sets the robot model, base pose, initial joint angles and tool, and lists the
 equipment. Edit the file and call /workcell/reload to update the scene without restarting.
+With MoveIt (the default), workcell_executor runs recipe steps: see fairino_workcell.api.
 """
 
 import os
@@ -57,8 +58,17 @@ def launch_setup(context):
         executable='cell_manager',
         output='screen',
         parameters=[{'cell_file': cell_file, 'use_moveit': use_moveit,
-                     'use_sim_time': use_sim_time}])
-    return [robot_simulation, manager]
+                     'use_sim_time': use_sim_time,
+                     # with MoveIt, workcell_executor publishes the TF of movable objects
+                     'publish_movable_tf': not use_moveit}])
+    actions = [robot_simulation, manager]
+    if use_moveit:
+        actions.append(Node(
+            package='fairino_workcell',
+            executable='workcell_executor',
+            output='screen',
+            parameters=[{'cell_file': cell_file, 'use_sim_time': use_sim_time}]))
+    return actions
 
 
 def generate_launch_description():

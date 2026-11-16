@@ -18,7 +18,7 @@ NAME_PATTERN = re.compile(r'^[A-Za-z][A-Za-z0-9_]*$')
 CELL_KEYS = ('cell', 'robot', 'objects')
 ROBOT_KEYS = ('model', 'base', 'initial_positions', 'initial_positions_deg', 'tool')
 OBJECT_KEYS = ('name', 'visual', 'collision', 'units', 'box', 'cylinder', 'pose', 'color',
-               'frames', 'touch_links')
+               'frames', 'touch_links', 'movable')
 VISUAL_FORMATS = ('.glb', '.gltf', '.dae', '.obj', '.stl')
 EMBEDDED_MATERIAL_FORMATS = ('.glb', '.gltf', '.dae')
 DEFAULT_COLOR = (0.62, 0.64, 0.68, 1.0)
@@ -63,6 +63,11 @@ class CellObject:
     color_given: bool
     frames: tuple
     touch_links: tuple
+    movable: bool = False
+
+    def frame(self, name):
+        """Return the Pose of a named frame of the object, or None."""
+        return dict(self.frames).get(name)
 
 
 @dataclass(frozen=True)
@@ -232,7 +237,14 @@ def _load_object(item, index, base_dir, links, path):
         color_given='color' in item,
         frames=_frames(item.get('frames'), where),
         touch_links=_touch_links(item.get('touch_links'), links, where),
+        movable=_flag(item.get('movable', False), 'movable', where),
     )
+
+
+def _flag(value, what, where):
+    if not isinstance(value, bool):
+        raise CellError(f'{where}: {what} must be true or false')
+    return value
 
 
 def _mesh_geometry(item, base_dir, where):

@@ -10,8 +10,9 @@ ROS parameters:
 
 Service:
   /workcell/reload (std_srvs/Trigger)  read cell_file again and update everything
-Topic:
+Topics:
   /workcell/markers (visualization_msgs/MarkerArray, latched)  visual meshes for RViz
+  /workcell/cell (std_msgs/String, latched)  '<cell file>#<n>' after every (re)load
 """
 
 import threading
@@ -32,6 +33,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_msgs.msg import TFMessage
 from visualization_msgs.msg import MarkerArray
@@ -82,6 +84,9 @@ class WorkcellManager(Node):
         self.use_gazebo = self.declare_parameter('use_gazebo', True).value
         world = self.declare_parameter('gazebo_world', 'empty').value
         self.wait_timeout = float(self.declare_parameter('wait_timeout', 120.0).value)
+        # Movable objects get dynamic TF from workcell_executor when it runs.
+        self.publish_movable_tf = self.declare_parameter('publish_movable_tf', True).value
+        self.applied = 0
 
         group = ReentrantCallbackGroup()
         self.apply_client = self.create_client(ApplyPlanningScene, 'apply_planning_scene',
@@ -94,6 +99,7 @@ class WorkcellManager(Node):
         # updates to frames it has already sent, so moved objects would keep their old pose.
         self.tf_publisher = self.create_publisher(TFMessage, '/tf_static', latched)
         self.marker_publisher = self.create_publisher(MarkerArray, 'workcell/markers', latched)
+        self.cell_publisher = self.create_publisher(String, 'workcell/cell', latched)
         self.create_service(Trigger, 'workcell/reload', self.on_reload, callback_group=group)
         self.gazebo = Gazebo(world) if self.use_gazebo else None
         self.cell = None
@@ -105,8 +111,8 @@ class WorkcellManager(Node):
             cell = load_cell(self.cell_file)
             previous = self.cell
             timeout = self.wait_timeout if startup else 5.0
-            self.tf_publisher.publish(TFMessage(
-                transforms=static_transforms(cell, self.get_clock().now().to_msg())))
+            self.tf_publisher.publish(TFMessage(transforms=static_transforms(
+                cell, self.get_clock().now().to_msg(), self.publish_movable_tf)))
             self.marker_publisher.publish(markers(cell))
             results = [f'TF {len(cell.frame_names())} frames']
             if self.use_moveit:
@@ -114,6 +120,8 @@ class WorkcellManager(Node):
             if self.gazebo is not None:
                 results.append('Gazebo ' + self.apply_gazebo(cell, previous, timeout))
             self.cell = cell
+            self.applied += 1
+            self.cell_publisher.publish(String(data=f'{cell.path}#{self.applied}'))
             return f"workcell '{cell.name}' ({len(cell.objects)} objects): " + ', '.join(results)
 
     def apply_moveit(self, cell, previous, timeout):

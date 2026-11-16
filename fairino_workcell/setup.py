@@ -37,6 +37,8 @@ setup(
         'console_scripts': [
             'cell_manager = fairino_workcell.cell_manager:main',
             'import_cad = fairino_workcell.cad_import:main',
+            'run_recipe = fairino_workcell.api:main',
+            'workcell_executor = fairino_workcell.executor:main',
         ],
     },
 )
