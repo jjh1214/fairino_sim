@@ -1,21 +1,55 @@
-<robot name="fairino_cobot" xmlns:xacro="http://www.ros.org/wiki/xacro">
+<?xml version="1.0"?>
+<!--
+  Simulated FAIRINO cobot, shared by Gazebo, MoveIt and RViz.
+
+  The launch files build it through fairino_sim.description, which resolves
+  tool files and passes the arguments below. robot_name must always be given.
+-->
+<robot name="$(arg robot_name)_robot" xmlns:xacro="http://www.ros.org/wiki/xacro">
 
   <xacro:arg name="robot_name" default="fairino5_v6"/>
+  <!-- ros2_control parameters loaded by the gz_ros2_control plugin -->
+  <xacro:arg name="controllers_file" default="$(find fairino_sim)/config/frcobot_controller2.yaml"/>
+  <!-- Pose of base_link in the world frame -->
+  <xacro:arg name="base_xyz" default="0 0 0"/>
+  <xacro:arg name="base_rpy" default="0 0 0"/>
+  <!-- Initial joint angles j1..j6 in radians -->
+  <xacro:arg name="initial_positions" default="0.0 -1.571 0.0 0.0 0.0 0.0"/>
+  <!-- Optional tool on the flange: empty tool_visual means no tool -->
+  <xacro:arg name="tool_visual" default=""/>
+  <xacro:arg name="tool_collision" default=""/>
+  <xacro:arg name="tool_scale" default="1.0"/>
+  <xacro:arg name="tool_mount_xyz" default="0 0 0"/>
+  <xacro:arg name="tool_mount_rpy" default="0 0 0"/>
+  <xacro:arg name="tool_mass" default="0.5"/>
+  <xacro:arg name="tcp_xyz" default="0 0 0"/>
+  <xacro:arg name="tcp_rpy" default="0 0 0"/>
+
   <xacro:property name="model" value="$(arg robot_name)"/>
 
-  <xacro:include filename="$(find fairino_description)/urdf/${model}.urdf" />
-  <xacro:include filename="$(find fairino_sim)/config/frcobot_gz.xacro" />
-  <xacro:include filename="$(find fairino_sim)/config/frcobot_gz_ros2_control.xacro" />
+  <xacro:include filename="$(find fairino_description)/urdf/${model}.urdf"/>
+  <xacro:include filename="$(find fairino_sim)/config/frcobot_gz.xacro"/>
+  <xacro:include filename="$(find fairino_sim)/config/frcobot_gz_ros2_control.xacro"/>
+  <xacro:include filename="$(find fairino_sim)/config/frcobot_tool.xacro"/>
 
-  <xacro:frcobot_gz />
-  <xacro:frcobot_gz_ros2_control />
+  <xacro:frcobot_gz controllers_file="$(arg controllers_file)"/>
+  <xacro:frcobot_gz_ros2_control initial_positions="$(arg initial_positions)"/>
+  <xacro:frcobot_tool model="${model}"
+                      visual="$(arg tool_visual)"
+                      collision="$(arg tool_collision)"
+                      scale="$(arg tool_scale)"
+                      mount_xyz="$(arg tool_mount_xyz)"
+                      mount_rpy="$(arg tool_mount_rpy)"
+                      mass="$(arg tool_mass)"
+                      tcp_xyz="$(arg tcp_xyz)"
+                      tcp_rpy="$(arg tcp_rpy)"/>
 
   <link name="world"/>
 
   <joint name="world_to_base_link" type="fixed">
     <parent link="world"/>
     <child link="base_link"/>
-    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <origin xyz="$(arg base_xyz)" rpy="$(arg base_rpy)"/>
   </joint>
 
 </robot>

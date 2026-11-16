@@ -1,0 +1,8 @@
+# Distance in metres along the j6 axis from the wrist3_link frame to the flange face.
+# Measured from the end of each wrist3_link mesh in fairino_description.
+fairino3_v6: 0.1000
+fairino5_v6: 0.0990
+fairino10_v6: 0.1060
+fairino16_v6: 0.1060
+fairino20_v6: 0.1200
+fairino30_v6: 0.1200

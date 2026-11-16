@@ -1,0 +1,61 @@
+<?xml version="1.0"?>
+<!--
+  Frames added on top of the fairino_description arm:
+    flange    : tool mounting face at the end of wrist3_link (always present)
+    tool_link : optional tool body mounted on the flange
+    tcp       : tool centre point, on tool_link if a tool is present, else on the flange
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:macro name="frcobot_tool"
+               params="model visual collision scale mount_xyz mount_rpy mass tcp_xyz tcp_rpy">
+
+    <xacro:property name="flange_offsets"
+                    value="${xacro.load_yaml('$(find fairino_sim)/config/flange_offsets.yaml')}"/>
+    <xacro:property name="has_tool" value="${visual != ''}"/>
+
+    <link name="flange"/>
+    <joint name="wrist3_to_flange" type="fixed">
+      <parent link="wrist3_link"/>
+      <child link="flange"/>
+      <origin xyz="0 0 ${flange_offsets.get(model, 0.0)}" rpy="0 0 0"/>
+    </joint>
+
+    <xacro:if value="${has_tool}">
+      <link name="tool_link">
+        <visual>
+          <geometry>
+            <mesh filename="${visual}" scale="${scale} ${scale} ${scale}"/>
+          </geometry>
+          <material name="fairino_sim_tool">
+            <color rgba="0.55 0.57 0.62 1.0"/>
+          </material>
+        </visual>
+        <collision>
+          <geometry>
+            <mesh filename="${collision}" scale="${scale} ${scale} ${scale}"/>
+          </geometry>
+        </collision>
+        <inertial>
+          <mass value="${mass}"/>
+          <origin xyz="0 0 0" rpy="0 0 0"/>
+          <!-- Rough inertia (5 cm radius of gyration); only Gazebo uses it -->
+          <inertia ixx="${mass * 0.0025}" ixy="0" ixz="0"
+                   iyy="${mass * 0.0025}" iyz="0" izz="${mass * 0.0025}"/>
+        </inertial>
+      </link>
+      <joint name="flange_to_tool" type="fixed">
+        <parent link="flange"/>
+        <child link="tool_link"/>
+        <origin xyz="${mount_xyz}" rpy="${mount_rpy}"/>
+      </joint>
+    </xacro:if>
+
+    <link name="tcp"/>
+    <joint name="tcp_joint" type="fixed">
+      <parent link="${'tool_link' if has_tool else 'flange'}"/>
+      <child link="tcp"/>
+      <origin xyz="${tcp_xyz}" rpy="${tcp_rpy}"/>
+    </joint>
+
+  </xacro:macro>
+</robot>

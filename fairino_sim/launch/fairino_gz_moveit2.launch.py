@@ -1,218 +1,118 @@
+"""
+Gazebo simulation of a FAIRINO cobot planned and executed through MoveIt 2.
+
+Gazebo, robot_state_publisher, move_group and RViz all use the same URDF and SRDF,
+built by fairino_sim.description (world frame, flange, optional tool).
+"""
+
 import os
+
 from ament_index_python.packages import get_package_share_directory
-
-from launch_ros.actions import Node
-from launch_ros.substitutions import FindPackageShare
-
+from fairino_sim import description, launch_common
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, OpaqueFunction, RegisterEventHandler, DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction, RegisterEventHandler
 from launch.event_handlers import OnProcessExit
-from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression, TextSubstitution
-
-import shutil
-
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
 from moveit_configs_utils import MoveItConfigsBuilder
 
-def generate_launch_description():
-    robot_name_arg = DeclareLaunchArgument(
-        "robot_name",
-        default_value="fairino5_v6",
-        description="Robot name for xacro, controllers, MoveIt config"
+# Joint damping used with the MoveIt joint trajectory controller in Gazebo.
+JOINT_DAMPING = 0.1
+PLANNING_PIPELINES = ['ompl', 'chomp', 'pilz_industrial_motion_planner', 'stomp']
+
+
+def launch_setup(context):
+    robot = launch_common.robot_settings(context)
+    robot_name = robot['robot_name']
+    description.check_model(robot_name, moveit=True)
+    use_sim_time = {'use_sim_time': robot['use_sim_time']}
+    use_rviz = LaunchConfiguration('use_rviz').perform(context).lower() in (
+        launch_common.TRUE_VALUES)
+
+    moveit_package = description.moveit_config_package(robot_name)
+    moveit_share = get_package_share_directory(moveit_package)
+    controllers_file = os.path.join(moveit_share, 'config', 'ros2_controllers.yaml')
+    joint_limits_file = os.path.join(
+        get_package_share_directory('fairino_sim'), 'config', 'custom_joint_limits.yaml')
+
+    urdf = description.build_urdf(
+        robot_name, controllers_file,
+        base_xyz=robot['base_xyz'], base_rpy=robot['base_rpy'],
+        initial_positions=robot['initial_positions'], tool=robot['tool'],
+        damping=JOINT_DAMPING)
+    srdf = description.build_srdf(robot_name, robot['tool'])
+
+    moveit_config = (
+        MoveItConfigsBuilder(robot_name, package_name=moveit_package)
+        .trajectory_execution(file_path='config/moveit_controllers.yaml')
+        .planning_pipelines(pipelines=PLANNING_PIPELINES)
+        .joint_limits(file_path=joint_limits_file)
+        .to_moveit_configs()
     )
+    # The MoveIt config package points at the plain fairino_description URDF. Replace it
+    # with the simulated robot so that MoveIt plans with the same model Gazebo runs.
+    moveit_config.robot_description = {'robot_description': urdf}
+    moveit_config.robot_description_semantic = {'robot_description_semantic': srdf}
 
-    use_sim_time_arg = DeclareLaunchArgument(
-        "use_sim_time",
-        default_value="true",
-        description="Use /clock from Gazebo if true"
-    )
-
-    robot_name   = LaunchConfiguration("robot_name")
-    use_sim_time = LaunchConfiguration("use_sim_time")
-    use_sim_time_param = {"use_sim_time": use_sim_time}
-
-    def robot_state_publisher(context, *args, **kwargs):
-        xacro_exe = shutil.which("xacro")
-        if not xacro_exe:
-            raise RuntimeError(
-                "❌ xacro not found. sudo apt install ros-jazzy-xacro"
-            )
-
-        select_robot = context.perform_substitution(robot_name)
-        xacro_file = os.path.join(
-            get_package_share_directory('fairino_sim'),
-            'config',
-            'frcobot_gz_moveit2.urdf.xacro'
-        )
-        raw = os.popen(
-            f'"{xacro_exe}" "{xacro_file}" '
-            f'robot_name:={select_robot} pkg_name:={select_robot}_moveit2_config'
-        ).read()
-
-        package_path = get_package_share_directory('fairino_description')
-        raw = raw.replace('package://fairino_description', f'file://{package_path}')
-        raw = raw.replace('damping="0"', 'damping="0.1"')
-        return [
-            Node(
-                package='robot_state_publisher',
-                executable='robot_state_publisher',
-                output='screen',
-                parameters=[{'robot_description': raw}]
-            )
-        ]
-
-    gz_sim = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([
-            PathJoinSubstitution([
-                FindPackageShare('ros_gz_sim'),
-                'launch',
-                'gz_sim.launch.py'
-            ])
-        ]),
-        launch_arguments={'gz_args': ' -r -v 1 empty.sdf'}.items()
-    )
-
-    bridge_params = os.path.join(
-        get_package_share_directory('fairino_sim'),
-        'config',
-        'gz_bridge.yaml'
-    )
-
-    ros_gz_bridge = Node(
-        package='ros_gz_bridge',
-        executable='parameter_bridge',
+    robot_state_publisher = Node(
+        package='robot_state_publisher',
+        executable='robot_state_publisher',
         output='screen',
-        arguments=['--ros-args', '-p', f'config_file:={bridge_params}'],
-    )
-
+        parameters=[moveit_config.robot_description, use_sim_time])
     gz_spawn_entity = Node(
         package='ros_gz_sim',
         executable='create',
         output='screen',
-        arguments=['-topic', 'robot_description', '-name',
-                   robot_name, '-allow_renaming', 'true'],
-    )
-
-    find_pkg_name = PythonExpression([
-        TextSubstitution(text="'"),
-        robot_name,
-        TextSubstitution(text="_moveit2_config'")
-    ])
-
-    robot_controllers = PathJoinSubstitution([
-        FindPackageShare(find_pkg_name),
-        'config',
-        'moveit_controllers.yaml',
-    ])
-
+        arguments=['-topic', 'robot_description', '-name', robot_name,
+                   '-allow_renaming', 'true'])
     joint_state_broadcaster_spawner = Node(
         package='controller_manager',
         executable='spawner',
-        arguments=['joint_state_broadcaster',
-                   '--param-file',
-                   robot_controllers,
-                   ],
-        parameters=[use_sim_time_param],
-    )
-
-    fairino_controller_spawner = Node(
+        arguments=['joint_state_broadcaster', '--param-file', controllers_file],
+        parameters=[use_sim_time])
+    arm_controller_spawner = Node(
         package='controller_manager',
         executable='spawner',
-        arguments=[
-            PythonExpression([
-                TextSubstitution(text="'"),
-                robot_name,
-                TextSubstitution(text="'"),
-                TextSubstitution(text=".rsplit('_',1)[0] + '_controller'"),
-            ]),
-            '--param-file',
-            robot_controllers,
-        ],
-        parameters=[use_sim_time_param],
-    )
+        arguments=[description.trajectory_controller_name(robot_name),
+                   '--param-file', controllers_file],
+        parameters=[use_sim_time])
 
-    def launch_moveit_and_rviz(context, *args, **kwargs):
+    moveit_nodes = [Node(
+        package='moveit_ros_move_group',
+        executable='move_group',
+        output='screen',
+        parameters=[moveit_config.to_dict(), use_sim_time])]
+    if use_rviz:
+        moveit_nodes.append(Node(
+            package='rviz2',
+            executable='rviz2',
+            name='rviz2',
+            output='log',
+            arguments=['-d', os.path.join(moveit_share, 'config', 'moveit.rviz')],
+            parameters=[
+                moveit_config.robot_description,
+                moveit_config.robot_description_semantic,
+                moveit_config.planning_pipelines,
+                moveit_config.robot_description_kinematics,
+                moveit_config.joint_limits,
+                use_sim_time,
+            ]))
 
-        robot = context.perform_substitution(robot_name)
-        pkg_name = context.perform_substitution(find_pkg_name)
-
-        custom_joint_limits_path = os.path.join(
-            get_package_share_directory("fairino_sim"),
-            "config",
-            "custom_joint_limits.yaml",
-        )
-
-        moveit_config = (
-            MoveItConfigsBuilder(robot, package_name=pkg_name)
-            .robot_description_semantic(file_path=f"config/{robot}_robot.srdf")
-            .trajectory_execution(file_path="config/moveit_controllers.yaml")
-            .planning_pipelines(
-                pipelines=["ompl", "chomp", "pilz_industrial_motion_planner", "stomp"]
-            )
-            .joint_limits(file_path=custom_joint_limits_path)
-            .to_moveit_configs()
-        )
-
-        rviz_cfg = os.path.join(
-            get_package_share_directory(pkg_name),
-            'config',
-            'moveit.rviz'
-        )
-
-        return [
-
-            Node(
-                package="moveit_ros_move_group",
-                executable="move_group",
-                output="screen",
-                parameters=[moveit_config.to_dict(), use_sim_time_param],
-            ),
-
-            Node(
-                package="rviz2",
-                executable="rviz2",
-                name="rviz2",
-                output="log",
-                arguments=["-d", rviz_cfg],
-                parameters=[
-                    moveit_config.robot_description_semantic,
-                    moveit_config.planning_pipelines,
-                    moveit_config.robot_description_kinematics,
-                    moveit_config.joint_limits,
-                    use_sim_time_param,
-                ],
-            ),
-        ]
-
-    ld = LaunchDescription([
-        robot_name_arg,
-        use_sim_time_arg,
-
-        gz_sim,
-        ros_gz_bridge,
+    return [
+        robot_state_publisher,
         gz_spawn_entity,
+        RegisterEventHandler(OnProcessExit(
+            target_action=gz_spawn_entity,
+            on_exit=[joint_state_broadcaster_spawner, arm_controller_spawner])),
+        RegisterEventHandler(OnProcessExit(
+            target_action=arm_controller_spawner, on_exit=moveit_nodes)),
+    ]
 
-        RegisterEventHandler(
-            OnProcessExit(
-                target_action=gz_spawn_entity,
-                on_exit=[joint_state_broadcaster_spawner]
-            )
-        ),
-        RegisterEventHandler(
-            OnProcessExit(
-                target_action=gz_spawn_entity,
-                on_exit=[fairino_controller_spawner]
-            )
-        ),
 
-        RegisterEventHandler(
-            OnProcessExit(
-                target_action=fairino_controller_spawner,
-                on_exit=[OpaqueFunction(function=launch_moveit_and_rviz)]
-            )
-        ),
-
-        OpaqueFunction(function=robot_state_publisher),
-    ])
-
-    return ld
+def generate_launch_description():
+    return LaunchDescription(
+        launch_common.declare_robot_arguments()
+        + [DeclareLaunchArgument('use_rviz', default_value='true',
+                                 description='Start RViz with the MoveIt plugin')]
+        + launch_common.gazebo_actions()
+        + [OpaqueFunction(function=launch_setup)])

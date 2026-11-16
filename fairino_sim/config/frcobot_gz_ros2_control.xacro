@@ -1,84 +1,33 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
-	<xacro:macro name="frcobot_gz_ros2_control">
+
+	<!-- One position-controlled joint. Position limits come from the URDF. -->
+	<xacro:macro name="frcobot_gz_joint" params="name initial">
+		<joint name="${name}">
+			<command_interface name="position"/>
+			<state_interface name="position">
+				<param name="initial_value">${initial}</param>
+			</state_interface>
+			<state_interface name="velocity"/>
+			<state_interface name="effort"/>
+		</joint>
+	</xacro:macro>
+
+	<!-- initial_positions: angles of j1..j6 in radians, separated by spaces -->
+	<xacro:macro name="frcobot_gz_ros2_control" params="initial_positions">
+		<xacro:property name="q0" value="${initial_positions.split()}"/>
 
 		<ros2_control name="GazeboSimSystem" type="system">
 			<hardware>
 				<plugin>gz_ros2_control/GazeboSimSystem</plugin>
-	    	</hardware>
+			</hardware>
 
-	    	<joint name="j1">
-	    		<command_interface name="position">
-	    			<param name="min">-1.571</param>
-	    			<param name="max">1.571</param>
-	    		</command_interface>
-				<state_interface name="position">
-					<param name="initial_value">0.0</param>
-				</state_interface>
-	    		<state_interface name="velocity"/>
-	    		<state_interface name="effort"/>
-	    	</joint>
-
-	    	<joint name="j2">
-	    		<command_interface name="position">
-	    			<param name="min">-1.571</param>
-	    			<param name="max">1.571</param>
-	    		</command_interface>
-				<state_interface name="position">
-					<param name="initial_value">-1.571</param>
-				</state_interface>
-	    		<state_interface name="velocity"/>
-	    		<state_interface name="effort"/>
-	    	</joint>
-
-	    	<joint name="j3">
-	    		<command_interface name="position">
-	    			<param name="min">-1.571</param>
-	    			<param name="max">1.571</param>
-	    		</command_interface>
-				<state_interface name="position">
-					<param name="initial_value">0.0</param>
-				</state_interface>
-	    		<state_interface name="velocity"/>
-	    		<state_interface name="effort"/>
-	    	</joint>
-
-	    	<joint name="j4">
-	    		<command_interface name="position">
-	    			<param name="min">-1.571</param>
-	    			<param name="max">1.571</param>
-	    		</command_interface>
-				<state_interface name="position">
-					<param name="initial_value">0.0</param>
-				</state_interface>
-	    		<state_interface name="velocity"/>
-	    		<state_interface name="effort"/>
-	    	</joint>
-    
-	    	<joint name="j5">
-	    		<command_interface name="position">
-	    			<param name="min">-1.571</param>
-	    			<param name="max">1.571</param>
-	    		</command_interface>
-				<state_interface name="position">
-					<param name="initial_value">0.0</param>
-				</state_interface>
-	    		<state_interface name="velocity"/>
-	    		<state_interface name="effort"/>
-	    	</joint>
-
-        	<joint name="j6">
-	    		<command_interface name="position">
-	    			<param name="min">-1.571</param>
-	    			<param name="max">1.571</param>
-	    		</command_interface>
-				<state_interface name="position">
-					<param name="initial_value">0.0</param>
-				</state_interface>
-	    		<state_interface name="velocity"/>
-	    		<state_interface name="effort"/>
-	    	</joint>
-
+			<xacro:frcobot_gz_joint name="j1" initial="${q0[0]}"/>
+			<xacro:frcobot_gz_joint name="j2" initial="${q0[1]}"/>
+			<xacro:frcobot_gz_joint name="j3" initial="${q0[2]}"/>
+			<xacro:frcobot_gz_joint name="j4" initial="${q0[3]}"/>
+			<xacro:frcobot_gz_joint name="j5" initial="${q0[4]}"/>
+			<xacro:frcobot_gz_joint name="j6" initial="${q0[5]}"/>
 		</ros2_control>
 
 	</xacro:macro>

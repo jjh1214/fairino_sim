@@ -1,0 +1,15 @@
+# Example tool for fairino_sim: a simple two-finger gripper.
+# Use it with  tool:=example_gripper  (your own tools:  tool:=/path/to/tool.yaml)
+name: example_gripper
+mesh:
+  visual: example_gripper.stl      # STL, OBJ, DAE or GLB, relative to this file
+  collision: example_gripper.stl   # optional, defaults to visual
+  units: mm                        # required: m or mm
+mount:                             # tool origin relative to the robot flange
+  xyz: [0.0, 0.0, 0.0]             # metres
+  rpy: [0.0, 0.0, 0.0]             # radians (or rpy_deg: [..] in degrees)
+tcp:                               # tool centre point relative to the tool origin
+  xyz: [0.0, 0.0, 0.120]
+  rpy: [0.0, 0.0, 0.0]
+mass: 0.8                          # kg, used by Gazebo
+touch_links: [wrist3_link]         # robot links the tool may touch without a collision
