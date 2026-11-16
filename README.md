@@ -20,8 +20,10 @@ Supported models: `fairino3_v6`, `fairino5_v6`, `fairino10_v6`, `fairino16_v6`, 
 Install ROS 2 Jazzy (`ros-jazzy-desktop`) first, then Gazebo Harmonic, ros2_control and MoveIt 2:
 ```
 sudo apt install ros-jazzy-ros-gz ros-jazzy-gz-ros2-control ros-jazzy-ros2-controllers \
-  ros-jazzy-ros2controlcli ros-jazzy-moveit ros-jazzy-xacro
+  ros-jazzy-ros2controlcli ros-jazzy-moveit ros-jazzy-moveit-py ros-jazzy-xacro
 ```
+`ros-jazzy-moveit-py` is needed by the work cell executor (path checks); `ros-jazzy-moveit` does
+not install it.
 
 Build the workspace (I recommend `~/fairino_ws/src`):
 ```
