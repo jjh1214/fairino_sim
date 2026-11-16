@@ -1,0 +1,6 @@
+# Set a virtual digital output of the work cell (published on /workcell/io).
+string name
+bool value
+---
+bool success
+string message

@@ -1,0 +1,18 @@
+# Move the robot with a PTP motion (straight line in joint space), after checking the whole
+# path for collisions, joint limits and clearance.
+uint8 JOINTS=0
+uint8 POSE=1
+uint8 target_type
+float64[] joints                   # JOINTS: j1..j6 [rad]
+geometry_msgs/PoseStamped pose     # POSE: TCP pose; header.frame_id is world, an object or
+                                   # an object frame such as part/grasp
+float64 speed                      # fraction of the joint velocity limits (0..1]; 0 = default
+string[] allowed_contacts          # objects the tool and the held object may touch in this move
+bool check_only                    # check in the check session only; do not move the robot
+string name                        # step name for the report
+---
+bool success
+StepReport report
+---
+string phase                       # target, check or execute
+float32 progress                   # 0..1 while executing

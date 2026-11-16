@@ -1,0 +1,9 @@
+# Close (grip) or open (release) the gripper.
+# Grip attaches the graspable object whose 'grasp' frame is nearest to the TCP (within the
+# grasp tolerance); release leaves the held object where it is.
+bool close
+bool check_only   # apply to the check session only; the simulation is not changed
+string name       # step name for the report
+---
+bool success
+StepReport report
