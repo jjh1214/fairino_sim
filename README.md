@@ -8,7 +8,7 @@ Simulation of FAIRINO cobots with ROS 2 Jazzy, Gazebo Harmonic and MoveIt 2.
 | Package | Contents |
 |---|---|
 | `fairino_sim` | Gazebo and MoveIt 2 launch files, robot and tool description |
-| `fairino_workcell` | Work cell tools: CAD import, cell scene, recipes, path validation (in progress) |
+| `fairino_workcell` | Work cell around the robot: CAD import, cell file, scene in Gazebo / MoveIt / TF (recipes and path validation: in progress) |
 | `fairino_workcell_msgs` | ROS 2 interfaces for `fairino_workcell` (in progress) |
 
 Robot models come from [FAIR-INNOVATION/frcobot_ros2](https://github.com/FAIR-INNOVATION/frcobot_ros2).
@@ -129,3 +129,69 @@ touch_links: [wrist3_link]     # robot links the tool may touch without a collis
 ```
 ros2 launch fairino_sim fairino_gz_moveit2.launch.py tool:=/path/to/my_gripper.yaml
 ```
+
+# Work cell
+`fairino_workcell` builds a work cell around the robot from one cell file. Equipment imported from
+CAD (STEP, STL, OBJ) appears in Gazebo, in the MoveIt planning scene (collision checking) and as
+TF frames.
+
+## Example cell
+```
+ros2 launch fairino_workcell fairino_workcell.launch.py
+```
+A fairino5_v6 with the example gripper on a pedestal, next to a belt conveyor (with a part at its
+stop position), a table and a safety fence.
+
+| Argument | Default | Description |
+|---|---|---|
+| `cell` | example conveyor cell | Path of the cell file |
+| `use_moveit` | `true` | Plan with MoveIt 2; `false` uses the joint position controller |
+| `use_rviz` | `true` | Start RViz (with `use_moveit`) |
+| `use_sim_time` | `true` | Use the Gazebo `/clock` |
+
+After editing the cell file, update the running simulation without restarting it:
+```
+ros2 service call /workcell/reload std_srvs/srv/Trigger
+```
+
+## Cell file
+```yaml
+cell: my_cell
+robot:
+  model: fairino5_v6
+  base: {xyz: [0.0, 0.0, 0.75]}                 # pose of base_link in the world frame
+  initial_positions_deg: [0, -90, 0, 0, 0, 0]   # or initial_positions in radians
+  tool: example_gripper                         # tool name, or tool YAML path relative to this file
+objects:
+  - name: conveyor                              # letters, digits and _
+    visual: meshes/conveyor/visual.glb          # GLB, DAE, OBJ or STL, relative to this file
+    collision: meshes/conveyor/collision.stl    # STL (may be omitted when visual is an STL)
+    units: m                                    # required for meshes: m or mm
+    pose: {xyz: [0.0, -0.6, 0.0], rpy_deg: [0, 0, 90]}   # in the world frame; or rpy in radians
+    color: [0.36, 0.40, 0.45, 1.0]              # optional
+    frames:                                     # optional named frames on the object
+      station: {xyz: [0.0, 0.0, 0.80]}
+  - name: pedestal
+    box: [0.30, 0.30, 0.75]                     # or cylinder: {radius: r, length: l}, in metres,
+    pose: {xyz: [0.0, 0.0, 0.375]}              # centred on the pose
+    touch_links: [base_link]                    # robot links allowed to touch this object
+```
+Each object is a TF frame named after it, and each named frame is `<object>/<frame>`
+(for example `conveyor/station`), also available as a MoveIt subframe.
+
+## Importing CAD files
+`import_cad` converts STEP, STL and OBJ files into a visual mesh (GLB) and a simplified collision
+mesh (STL), both in metres. STEP files carry their units; give `--units` for STL and OBJ files.
+It needs a few Python packages; install them once in a virtual environment:
+```
+python3 -m venv ~/fairino_cad_venv --system-site-packages
+~/fairino_cad_venv/bin/pip install -r ~/fairino_ws/src/fairino_sim/fairino_workcell/requirements-cad.txt
+```
+Then, from the directory of the cell file, with the workspace sourced:
+```
+~/fairino_cad_venv/bin/python -m fairino_workcell.cad_import cad/conveyor.step --out meshes
+~/fairino_cad_venv/bin/python -m fairino_workcell.cad_import cad/table.stl cad/fence.obj --units mm --out meshes
+```
+It prints the entries to paste into the cell file. Options: `--origin keep|center|bottom`
+(default: keep the CAD origin), `--collision mesh|convex|box` and `--max-faces N`
+(triangle budget of the collision mesh, default 3000).
