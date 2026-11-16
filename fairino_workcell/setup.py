@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'fairino_cell'
+package_name = 'fairino_workcell'
 
 setup(
     name=package_name,

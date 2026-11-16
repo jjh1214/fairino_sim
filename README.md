@@ -8,8 +8,8 @@ Simulation of FAIRINO cobots with ROS 2 Jazzy, Gazebo Harmonic and MoveIt 2.
 | Package | Contents |
 |---|---|
 | `fairino_sim` | Gazebo and MoveIt 2 launch files, robot and tool description |
-| `fairino_cell` | Work cell tools: CAD import, cell scene, recipes, path validation (in progress) |
-| `fairino_cell_msgs` | ROS 2 interfaces for `fairino_cell` (in progress) |
+| `fairino_workcell` | Work cell tools: CAD import, cell scene, recipes, path validation (in progress) |
+| `fairino_workcell_msgs` | ROS 2 interfaces for `fairino_workcell` (in progress) |
 
 Robot models come from [FAIR-INNOVATION/frcobot_ros2](https://github.com/FAIR-INNOVATION/frcobot_ros2).
 Supported models: `fairino3_v6`, `fairino5_v6`, `fairino10_v6`, `fairino16_v6`, `fairino20_v6`, `fairino30_v6`.
@@ -31,10 +31,10 @@ git clone https://github.com/FAIR-INNOVATION/frcobot_ros2.git
 git clone https://github.com/jjh1214/fairino_sim.git
 
 cd ~/fairino_ws
-colcon build --packages-up-to fairino_cell
+colcon build --packages-up-to fairino_workcell
 source install/setup.bash
 ```
-`--packages-up-to fairino_cell` builds the three packages of this repository and the parts of
+`--packages-up-to fairino_workcell` builds the three packages of this repository and the parts of
 frcobot_ros2 they need, and skips the real-robot drivers (`fairino_hardware*`).
 A plain `colcon build` also works and builds everything in `src`.
 

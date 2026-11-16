@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(fairino_cell_msgs)
+project(fairino_workcell_msgs)
 
 find_package(ament_cmake REQUIRED)
 

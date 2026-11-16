@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>fairino_cell_msgs</name>
+  <name>fairino_workcell_msgs</name>
   <version>0.0.0</version>
-  <description>ROS 2 interfaces for fairino_cell (recipe validation requests and reports)</description>
+  <description>ROS 2 interfaces for fairino_workcell (recipe validation requests and reports)</description>
   <maintainer email="scarlet777735@gmail.com">axbis-jhjung</maintainer>
   <license>MIT</license>
 
