@@ -71,8 +71,8 @@ def test_collision_objects_of_the_example_cell():
     conveyor = objects['conveyor']
     assert conveyor.header.frame_id == 'world' and len(conveyor.meshes) == 1
     assert len(conveyor.meshes[0].triangles) > 100
-    assert list(conveyor.subframe_names) == ['station']
-    assert conveyor.subframe_poses[0].position.z == pytest.approx(0.8)
+    assert list(conveyor.subframe_names) == ['entry', 'station']
+    assert conveyor.subframe_poses[1].position.z == pytest.approx(0.8)
     assert max(v.z for v in conveyor.meshes[0].vertices) == pytest.approx(0.84, abs=1e-3)
 
 

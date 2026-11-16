@@ -1,23 +1,36 @@
 """
-Run and check recipe steps in the work cell: PTP moves, grip and release, virtual IO.
+Run and check recipe steps in the work cell, and run the conveyors that bring the parts.
+
+Steps are PTP moves, grip and release, waits and virtual IO.
 
 Every step is checked before it runs (see fairino_workcell.robot_cell): the target must be
-reachable and within the joint limits, and the whole path must be free of collisions of the
-robot, the tool and the held object with the cell and with themselves. Steps that pass closer
-to the cell than clearance_warning are reported as warnings. Check-only steps use a separate
-check session, so a recipe can be validated without moving the simulation.
+reachable and within the joint limits, and the robot, the tool and the held object must not
+collide with the cell, with parts that conveyors move meanwhile, or with themselves. Steps that
+pass closer than clearance_warning are reported as warnings. Check-only steps use a separate
+check session in virtual time, so a recipe can be validated without moving the simulation.
+
+The conveyors run in simulation time. During a recipe run (/workcell/run/begin to
+/workcell/run/end) they only run while a step takes time: a move for its planned duration, a
+wait until its end. Checking a step, and the gaps between steps, take no cell time, as on a
+robot controller, so a run follows the timeline of its check. After /workcell/reset the
+conveyors wait for the next run; outside runs they run freely.
 
 Interfaces (fairino_workcell_msgs):
   action  /workcell/move          Move       check the path, then move (or only check)
   service /workcell/gripper       Gripper    grip the object at the TCP, or release it
-  service /workcell/set_io        SetIO      set a virtual digital output
+  service /workcell/wait          Wait       wait for a time or for an IO value
+  service /workcell/set_io        SetIO      set a virtual IO
   service /workcell/check/begin   std_srvs/Trigger  start a check session from the current state
   service /workcell/run/begin     std_srvs/Trigger  start a recipe run (clears the step markers)
+  service /workcell/run/end       std_srvs/Trigger  end the run: the conveyors run freely again
+  service /workcell/reset         std_srvs/Trigger  put objects and conveyors back to the start
   topic   /workcell/io            IOState    virtual IO (latched)
   topic   /workcell/step_report   StepReport one message per step
   topic   /workcell/check_markers visualization_msgs/MarkerArray  TCP paths of the steps
+  topic   /workcell/part_markers  visualization_msgs/MarkerArray  parts put in by conveyors
 """
 
+from dataclasses import replace
 import math
 import threading
 import time
@@ -27,20 +40,19 @@ from builtin_interfaces.msg import Duration
 from control_msgs.action import FollowJointTrajectory
 from fairino_sim import description
 from fairino_workcell import motion
-from fairino_workcell.cell import CellError, load_cell
+from fairino_workcell.cell import CellError, load_cell, Pose
+from fairino_workcell.gazebo import Gazebo
 from fairino_workcell.kinematics import KinematicsError
 from fairino_workcell.robot_cell import (DEFAULT_SPEED, HELD_TOUCH_LINKS, JOINTS, new_report,
                                          RobotCell, StepError)
-from fairino_workcell.scene import frame_transforms, transform_msg
+from fairino_workcell.scene import (collision_object, frame_transforms, gazebo_sdf,
+                                    object_color, object_markers, pose_msg, transform_msg)
 from fairino_workcell_msgs.action import Move
 from fairino_workcell_msgs.msg import IOState, StepReport
-from fairino_workcell_msgs.srv import Gripper, SetIO
+from fairino_workcell_msgs.srv import Gripper, SetIO, Wait
 from geometry_msgs.msg import Point
-from gz.msgs10.boolean_pb2 import Boolean
-from gz.msgs10.pose_pb2 import Pose as GzPose
-from gz.transport13 import Node as GzNode
-from moveit_msgs.msg import (AttachedCollisionObject, DisplayTrajectory, PlanningScene,
-                             RobotTrajectory)
+from moveit_msgs.msg import (AttachedCollisionObject, CollisionObject, DisplayTrajectory,
+                             PlanningScene, RobotTrajectory)
 from moveit_msgs.srv import ApplyPlanningScene
 import numpy as np
 import rclpy
@@ -59,6 +71,11 @@ from visualization_msgs.msg import Marker, MarkerArray
 STATUS_COLORS = {StepReport.OK: (0.2, 0.8, 0.3), StepReport.WARNING: (1.0, 0.65, 0.0),
                  StepReport.FAILED: (0.95, 0.15, 0.15)}
 LOAD_ERRORS = (CellError, KinematicsError, description.DescriptionError)
+SCENE_PERIOD = 0.1        # seconds between part pose updates sent to MoveIt
+
+
+def _matrix_pose(matrix):
+    return Pose(xyz=tuple(float(v) for v in matrix[:3, 3]), rpy=motion.matrix_rpy(matrix[:3, :3]))
 
 
 class WorkcellExecutor(Node):
@@ -78,11 +95,19 @@ class WorkcellExecutor(Node):
         self.execution_tolerance = float(p('execution_tolerance', 0.02).value)
         self.gazebo_world = p('gazebo_world', 'empty').value
         self.use_gazebo = p('use_gazebo', True).value
+        self.wait_timeout = float(p('wait_timeout', 120.0).value)
 
-        self.lock = threading.Lock()        # one step at a time
+        self.lock = threading.Lock()                     # one recipe step at a time
+        self.changed = threading.Condition(threading.Lock())   # run state; notified on changes
         self.joint_lock = threading.Lock()
         self.joint_positions = {}
-        self.io = {}
+        self.ready = False        # Gazebo and MoveIt are up and show the parts
+        self.in_run = False       # a recipe run is going on: steps grant the conveyor time
+        self.budget = math.inf    # cell time the conveyors may still run (inf: freely)
+        self.last_tick = None
+        self.gz_poses, self.scene_poses = {}, {}   # last poses sent to Gazebo and MoveIt
+        self.scene_sent = 0.0
+        self.io_sent = None
         self.step_count = 0
         self.markers = MarkerArray()
         self.cell_version = None
@@ -105,21 +130,27 @@ class WorkcellExecutor(Node):
         self.io_pub = self.create_publisher(IOState, '/workcell/io', latched)
         self.tf_pub = self.create_publisher(TFMessage, '/tf', 20)
         self.marker_pub = self.create_publisher(MarkerArray, '/workcell/check_markers', latched)
+        self.part_marker_pub = self.create_publisher(MarkerArray, '/workcell/part_markers',
+                                                     latched)
+        self.scene_pub = self.create_publisher(PlanningScene, '/planning_scene', 20)
         self.display_pub = self.create_publisher(DisplayTrajectory, '/display_planned_path', 5)
         ActionServer(self, Move, '/workcell/move', self._on_move, callback_group=group,
                      cancel_callback=lambda _: CancelResponse.ACCEPT)
         self.create_service(Gripper, '/workcell/gripper', self._on_gripper, callback_group=group)
+        self.create_service(Wait, '/workcell/wait', self._on_wait, callback_group=group)
         self.create_service(SetIO, '/workcell/set_io', self._on_set_io, callback_group=group)
         self.create_service(Trigger, '/workcell/check/begin', self._on_check_begin,
                             callback_group=group)
         self.create_service(Trigger, '/workcell/run/begin', self._on_run_begin,
                             callback_group=group)
-        self.gz = GzNode() if self.use_gazebo else None
-        self.create_timer(0.05, self._publish_objects, callback_group=group)
-        self.io_pub.publish(IOState())
+        self.create_service(Trigger, '/workcell/run/end', self._on_run_end, callback_group=group)
+        self.create_service(Trigger, '/workcell/reset', self._on_reset, callback_group=group)
+        self.gazebo = Gazebo(self.gazebo_world) if self.use_gazebo else None
+        self.create_timer(0.05, self._tick, callback_group=group)
+        threading.Thread(target=self._bring_up, daemon=True).start()
         self.get_logger().info(
             f"workcell executor ready for '{self.cell.name}' ({self.cell.robot.model}, "
-            f'controller {self.controller})')
+            f'controller {self.controller}, {len(self.core.conveyors.models)} conveyors)')
 
     # ------------------------------------------------------------------ cell and state
     def _load_cell(self, path):
@@ -128,6 +159,22 @@ class WorkcellExecutor(Node):
         self.cell = cell
         self.run_state = self.core.initial_state()
         self.check_state = None
+        self.gz_poses = {name: pose.copy() for name, pose in self.core.movable_poses.items()}
+        self.scene_poses = dict(self.gz_poses)
+
+    def _bring_up(self):
+        """Wait for Gazebo and MoveIt, show the first parts, then start the conveyors."""
+        if self.gazebo is not None and not self.gazebo.wait(self.wait_timeout):
+            self.get_logger().error('Gazebo is not running: parts are not shown there')
+            self.gazebo = None
+        if not self.scene_client.wait_for_service(timeout_sec=self.wait_timeout):
+            self.get_logger().error('move_group is not running: parts are not in its scene')
+        with self.changed:
+            parts = list(self.run_state.parts)
+        self._show_parts(parts)
+        with self.changed:
+            self.last_tick = None
+            self.ready = True
 
     def _on_cell(self, msg):
         path, _, version = msg.data.rpartition('#')
@@ -138,13 +185,26 @@ class WorkcellExecutor(Node):
             return
         self.cell_version = version
         with self.lock:
-            for name in list(self.run_state.held):
-                self._move_group_attach(name, attach=False)
+            self._clear_cell_state()
             try:
-                self._load_cell(path)
+                with self.changed:
+                    self._load_cell(path)
+                    self.last_tick = None
                 self.get_logger().info(f'cell reloaded: {path}')
             except LOAD_ERRORS as exc:
                 self.get_logger().error(f'cannot reload the cell: {exc}')
+            with self.changed:
+                parts = list(self.run_state.parts)
+            self._show_parts(parts)
+
+    def _clear_cell_state(self):
+        """Detach held objects and remove the parts from Gazebo, MoveIt and RViz."""
+        with self.changed:
+            held, parts = list(self.run_state.held), list(self.run_state.parts)
+        for name in held:
+            self._move_group_attach(name, attach=False)
+            self.scene_poses[name] = None
+        self._hide_parts(parts)
 
     def _on_joint_states(self, msg):
         with self.joint_lock:
@@ -156,23 +216,8 @@ class WorkcellExecutor(Node):
                 raise StepError('no joint states received yet')
             return tuple(self.joint_positions[name] for name in JOINTS)
 
-    def _state(self, check_only):
-        if not check_only:
-            self.run_state.joints = self.current_joints()
-            return self.run_state
-        if self.check_state is None:
-            self._begin_check()
-        return self.check_state
-
-    def _begin_check(self):
-        self.run_state.joints = self.current_joints()
-        self.check_state = self.run_state.copy()
-        self._clear_markers()
-
-    def _clear_markers(self):
-        self.markers = MarkerArray(markers=[Marker(action=Marker.DELETEALL)])
-        self.marker_pub.publish(self.markers)
-        self.markers = MarkerArray()
+    def _now(self):
+        return self.get_clock().now().nanoseconds * 1e-9
 
     def _call(self, client, request, timeout):
         if not client.wait_for_service(timeout_sec=5.0):
@@ -185,6 +230,177 @@ class WorkcellExecutor(Node):
             return None
         return future.result()
 
+    # ------------------------------------------------------------------ conveyor clock
+    def _tick(self):
+        """Run the conveyors in simulation time and show where everything is."""
+        try:
+            now = self._now()
+            with self.changed:
+                dt = 0.0 if self.last_tick is None else max(0.0, now - self.last_tick)
+                self.last_tick = now
+                new = []
+                step = min(dt, self.budget)
+                if self.ready and step > 0.0:
+                    new = self.core.advance(self.run_state, step)
+                    self.budget -= step
+                    self.changed.notify_all()
+                state = self.run_state
+                try:
+                    joints = self.current_joints()
+                except StepError:
+                    joints = state.joints
+                poses, held = self.core.object_poses(state, joints)
+                parts, io = dict(state.parts), dict(state.io)
+            if new:
+                self._show_parts(new)
+            self._publish_objects(poses, held, parts)
+            if io != self.io_sent:
+                self.io_pub.publish(IOState(names=list(io), values=list(io.values())))
+                self.io_sent = io
+        except Exception as exc:  # keep running even if one cycle fails (e.g. during reload)
+            self.get_logger().debug(f'tick skipped: {exc}')
+
+    def _publish_objects(self, poses, held, parts):
+        stamp = self.get_clock().now().to_msg()
+        transforms, moved = [], []
+        for name, pose in poses.items():
+            transforms.append(transform_msg('world', name, pose, stamp))
+            transforms.extend(frame_transforms(self.core.definition(name, parts), stamp))
+            if self.gazebo is not None and name in self.gz_poses and \
+                    not np.array_equal(self.gz_poses[name], pose):
+                self.gazebo.set_pose(name, pose)
+                self.gz_poses[name] = pose
+            if name not in held and name in self.scene_poses and (
+                    self.scene_poses[name] is None
+                    or not np.array_equal(self.scene_poses[name], pose)):
+                moved.append(name)
+        if transforms:
+            self.tf_pub.publish(TFMessage(transforms=transforms))
+        if moved and time.monotonic() - self.scene_sent >= SCENE_PERIOD:
+            scene = PlanningScene(is_diff=True)
+            scene.robot_state.is_diff = True
+            for name in moved:
+                obj = CollisionObject(id=name, operation=CollisionObject.MOVE)
+                obj.header.frame_id = 'world'
+                obj.pose = pose_msg(_matrix_pose(poses[name]))
+                scene.world.collision_objects.append(obj)
+                self.scene_poses[name] = poses[name]
+            self.scene_pub.publish(scene)
+            self.scene_sent = time.monotonic()
+
+    def _show_parts(self, names):
+        """Put new parts into Gazebo, the MoveIt scene and RViz."""
+        with self.changed:
+            state = self.run_state
+            items = [(name, replace(self.core.definition(name, state.parts),
+                                    pose=_matrix_pose(state.poses[name])), state.poses[name])
+                     for name in names if name in state.poses]
+            all_parts = [self.core.definition(name, state.parts) for name in state.parts]
+        if items:
+            scene = PlanningScene(is_diff=True)
+            scene.robot_state.is_diff = True
+            for name, obj, pose in items:
+                if self.gazebo is not None and self.gazebo.spawn(gazebo_sdf(obj)):
+                    self.gz_poses[name] = pose
+                scene.world.collision_objects.append(collision_object(obj))
+                scene.object_colors.append(object_color(obj))
+                self.scene_poses[name] = pose
+            response = self._call(self.scene_client, ApplyPlanningScene.Request(scene=scene), 10.0)
+            if response is None or not response.success:
+                names = ', '.join(name for name, _, _ in items)
+                self.get_logger().warning(f'MoveIt did not add {names}')
+        self.part_marker_pub.publish(object_markers(all_parts, 'parts'))
+
+    def _hide_parts(self, names):
+        scene = PlanningScene(is_diff=True)
+        for name in names:
+            if self.gazebo is not None and name in self.gz_poses:
+                self.gazebo.remove(name)
+            self.gz_poses.pop(name, None)
+            if name in self.scene_poses:
+                del self.scene_poses[name]
+                scene.world.collision_objects.append(
+                    CollisionObject(id=name, operation=CollisionObject.REMOVE))
+        if scene.world.collision_objects:
+            self._call(self.scene_client, ApplyPlanningScene.Request(scene=scene), 10.0)
+        self.part_marker_pub.publish(object_markers([], 'parts'))
+
+    # ------------------------------------------------------------------ sessions
+    def _step_state(self, check_only, snapshot=False):
+        """Return the state a step works on; the conveyors wait while the step is checked."""
+        with self.changed:
+            if check_only:
+                if self.check_state is None:
+                    self._begin_check()
+                return self.check_state
+            self.budget = 0.0
+            self.run_state.joints = self.current_joints()
+            return self.run_state.copy() if snapshot else self.run_state
+
+    def _grant(self, seconds):
+        """Let the conveyors run while a step takes time (freely outside a run)."""
+        with self.changed:
+            self.budget = seconds if self.in_run else math.inf
+
+    def _end_step(self):
+        self._grant(0.0)
+
+    def _begin_check(self):
+        self.run_state.joints = self.current_joints()
+        self.check_state = self.run_state.copy()
+        self._clear_markers()
+
+    def _clear_markers(self):
+        self.markers = MarkerArray(markers=[Marker(action=Marker.DELETEALL)])
+        self.marker_pub.publish(self.markers)
+        self.markers = MarkerArray()
+
+    def _on_check_begin(self, request, response):
+        with self.lock, self.changed:
+            try:
+                self._begin_check()
+                response.success, response.message = True, 'check session started'
+            except StepError as exc:
+                response.success, response.message = False, str(exc)
+        return response
+
+    def _on_run_begin(self, request, response):
+        with self.lock, self.changed:
+            self.in_run, self.budget = True, 0.0
+            self._clear_markers()
+        response.success, response.message = True, 'run started'
+        return response
+
+    def _on_run_end(self, request, response):
+        with self.lock, self.changed:
+            self.in_run, self.budget = False, math.inf
+        response.success, response.message = True, 'run ended; the conveyors run freely'
+        return response
+
+    def _on_reset(self, request, response):
+        with self.lock:
+            self._clear_cell_state()
+            with self.changed:
+                try:
+                    joints = self.current_joints()
+                except StepError:
+                    joints = None
+                self.run_state = self.core.initial_state(joints)
+                self.check_state = None
+                self.in_run, self.budget = True, 0.0     # wait for the next run
+                self.last_tick = None
+                for name, pose in self.core.movable_poses.items():
+                    self.scene_poses[name] = None     # send the start poses again
+                    if name in self.gz_poses:
+                        self.gz_poses[name] = None
+                parts = list(self.run_state.parts)
+                self._clear_markers()
+                self.changed.notify_all()
+            self._show_parts(parts)
+        response.success = True
+        response.message = 'cell reset; the conveyors wait for the next run'
+        return response
+
     # ------------------------------------------------------------------ move
     def _on_move(self, goal_handle):
         goal = goal_handle.request
@@ -193,15 +409,19 @@ class WorkcellExecutor(Node):
             report = new_report(goal.name or 'move', 'move', goal.check_only)
             state = None
             try:
-                state = self._state(goal.check_only)
-                report.start_joints = list(state.joints)
+                state = self._step_state(goal.check_only, snapshot=True)
+                report.start_time, report.start_joints = state.time, list(state.joints)
                 self._move(goal, state, report, goal_handle)
             except StepError as exc:
                 report.status, report.message = StepReport.FAILED, str(exc)
             except Exception as exc:  # report internal errors instead of dropping the goal
                 self.get_logger().error(traceback.format_exc())
                 report.status, report.message = StepReport.FAILED, f'internal error: {exc}'
-            report.end_joints = list(state.joints) if state is not None else []
+            finally:
+                if not goal.check_only:
+                    self._end_step()
+            if state is not None:
+                report.end_joints = list(self._state_of(goal.check_only).joints)
             self._finish(report)
         result = Move.Result(success=report.status != StepReport.FAILED, report=report)
         if goal_handle.is_cancel_requested:
@@ -211,6 +431,9 @@ class WorkcellExecutor(Node):
         else:
             goal_handle.abort()
         return result
+
+    def _state_of(self, check_only):
+        return self.check_state if check_only else self.run_state
 
     def _move(self, goal, state, report, goal_handle):
         goal_handle.publish_feedback(Move.Feedback(phase='target'))
@@ -228,16 +451,20 @@ class WorkcellExecutor(Node):
         self._add_path_marker(report, plan.check)
         if report.status == StepReport.FAILED:
             return
-        end = plan.goal
-        if not goal.check_only:
-            goal_handle.publish_feedback(Move.Feedback(phase='execute'))
-            self._execute(plan, goal_handle)
-            end = self.current_joints()
-            error = float(np.max(np.abs(np.asarray(end) - np.asarray(plan.goal))))
-            if error > self.execution_tolerance:
-                report.status = max(report.status, StepReport.WARNING)
-                report.message += f'; tracking error {math.degrees(error):.1f} deg'
-        self.core.complete_move(state, end)
+        if goal.check_only:
+            self.core.advance(state, plan.profile.duration)
+            self.core.complete_move(state, plan.goal)
+            return
+        self._grant(plan.profile.duration)      # the conveyors run while the robot moves
+        goal_handle.publish_feedback(Move.Feedback(phase='execute'))
+        self._execute(plan, goal_handle)
+        end = self.current_joints()
+        error = float(np.max(np.abs(np.asarray(end) - np.asarray(plan.goal))))
+        if error > self.execution_tolerance:
+            report.status = max(report.status, StepReport.WARNING)
+            report.message += f'; tracking error {math.degrees(error):.1f} deg'
+        with self.changed:
+            self.core.complete_move(self.run_state, end)
 
     def _execute(self, plan, goal_handle):
         times, positions, velocities, accelerations = motion.sample_ptp(
@@ -284,22 +511,32 @@ class WorkcellExecutor(Node):
             self.step_count += 1
             report = new_report(request.name or kind, kind, request.check_only)
             try:
-                state = self._state(request.check_only)
-                report.start_joints = report.end_joints = list(state.joints)
-                if request.close:
-                    name = self.core.grip(state, report)
-                    if not request.check_only:
-                        self._move_group_attach(name, attach=True)
-                else:
-                    released = self.core.release(state, report)
-                    if released and not request.check_only:
-                        self._move_group_attach(released[0], attach=False)
-                        self._gazebo_pose(*released)
+                state = self._step_state(request.check_only)
+                with self.changed:
+                    report.start_time = state.time
+                    report.start_joints = report.end_joints = list(state.joints)
+                    if request.close:
+                        result = self.core.grip(state, report)
+                    else:
+                        result = self.core.release(state, report)
+                if result and not request.check_only:
+                    if request.close:
+                        self._move_group_attach(result, attach=True)
+                    else:
+                        name, pose = result
+                        self._move_group_attach(name, attach=False)
+                        self.scene_poses[name] = pose
+                        if self.gazebo is not None and name in self.gz_poses:
+                            self.gazebo.set_pose(name, pose)
+                            self.gz_poses[name] = pose
             except StepError as exc:
                 report.status, report.message = StepReport.FAILED, str(exc)
             except Exception as exc:  # report internal errors instead of failing the service
                 self.get_logger().error(traceback.format_exc())
                 report.status, report.message = StepReport.FAILED, f'internal error: {exc}'
+            finally:
+                if not request.check_only:
+                    self._end_step()
             self._finish(report)
         response.success = report.status != StepReport.FAILED
         response.report = report
@@ -316,63 +553,81 @@ class WorkcellExecutor(Node):
         if response is None or not response.success:
             self.get_logger().warning(f"MoveIt did not {'attach' if attach else 'detach'} {name}")
 
-    # ------------------------------------------------------------------ objects, IO, reports
-    def _publish_objects(self):
-        """Publish the TF of the movable objects; held ones follow the TCP (also in Gazebo)."""
-        try:
-            state = self.run_state
+    # ------------------------------------------------------------------ waits and IO
+    def _on_wait(self, request, response):
+        report = new_report(request.name or 'wait', 'wait', request.check_only)
+        with self.lock:
+            self.step_count += 1
+            state = None
             try:
-                joints = self.current_joints()
-            except StepError:
-                joints = state.joints
-            poses, held = self.core.object_poses(state, joints)
-            stamp = self.get_clock().now().to_msg()
-            transforms = []
-            for name, pose in poses.items():
-                transforms.append(transform_msg('world', name, pose, stamp))
-                transforms.extend(frame_transforms(self.core.objects[name], stamp))
-                if name in held:
-                    self._gazebo_pose(name, pose)
-            if transforms:
-                self.tf_pub.publish(TFMessage(transforms=transforms))
-        except Exception as exc:  # keep publishing even if one cycle fails (e.g. during reload)
-            self.get_logger().debug(f'object publishing skipped: {exc}')
+                state = self._step_state(request.check_only, snapshot=True)
+                report.start_time = state.time
+                report.start_joints = report.end_joints = list(state.joints)
+                plan = self.core.plan_wait(state, report, request.io, request.value,
+                                           request.seconds, request.check_only)
+                if plan.check is not None:
+                    self._add_path_marker(report, plan.check)
+                if report.status != StepReport.FAILED:
+                    if request.check_only:
+                        self.core.advance(state, plan.duration)
+                    else:
+                        self._grant(math.inf if plan.duration is None else plan.duration)
+                        self._wait_run(request, plan, report)
+            except StepError as exc:
+                report.status, report.message = StepReport.FAILED, str(exc)
+            except Exception as exc:  # report internal errors instead of failing the service
+                self.get_logger().error(traceback.format_exc())
+                report.status, report.message = StepReport.FAILED, f'internal error: {exc}'
+            finally:
+                if not request.check_only:
+                    self._end_step()
+            self._finish(report)
+        response.success = report.status != StepReport.FAILED
+        response.report = report
+        return response
 
-    def _gazebo_pose(self, name, matrix):
-        if self.gz is None:
-            return
-        request = GzPose()
-        request.name = name
-        request.position.x, request.position.y, request.position.z = (
-            float(v) for v in matrix[:3, 3])
-        q = motion.matrix_quaternion(matrix[:3, :3])
-        request.orientation.x, request.orientation.y = q[0], q[1]
-        request.orientation.z, request.orientation.w = q[2], q[3]
-        self.gz.request(f'/world/{self.gazebo_world}/set_pose', request, GzPose, Boolean, 200)
+    def _wait_run(self, request, plan, report):
+        """Wait in the simulation until the time has passed or the IO has the value."""
+        target = 'true' if request.value else 'false'
+        with self.changed:
+            start = self.run_state.time
+            while True:
+                elapsed = self.run_state.time - start
+                if request.io and self.run_state.io.get(request.io, False) == request.value:
+                    break
+                if not request.io and elapsed >= request.seconds - 1e-6:
+                    break
+                if request.io and request.seconds > 0.0 and elapsed >= request.seconds:
+                    raise StepError(f'timed out after {request.seconds:.1f} s waiting for '
+                                    f'{request.io} = {target}')
+                self.changed.wait(0.2)
+            report.duration = self.run_state.time - start
+        if request.io and plan.duration is None:
+            report.message = f'{request.io} = {target} after {report.duration:.2f} s'
 
     def _on_set_io(self, request, response):
-        self.io[request.name] = request.value
-        self.io_pub.publish(IOState(names=list(self.io), values=list(self.io.values())))
-        response.success, response.message = True, f'{request.name} = {request.value}'
+        report = new_report(request.name or f'set {request.io}', 'io', request.check_only)
+        try:
+            with self.changed:
+                if request.check_only:
+                    if self.check_state is None:
+                        self._begin_check()
+                    state = self.check_state
+                else:
+                    state = self.run_state
+                report.start_time = state.time
+                self.core.set_io(state, request.io, request.value, report)
+                self.changed.notify_all()
+        except StepError as exc:
+            report.status, report.message = StepReport.FAILED, str(exc)
+        self._finish(report)
+        response.success = report.status != StepReport.FAILED
+        response.report = report
         return response
 
-    def _on_check_begin(self, request, response):
-        with self.lock:
-            try:
-                self._begin_check()
-                response.success, response.message = True, 'check session started'
-            except StepError as exc:
-                response.success, response.message = False, str(exc)
-        return response
-
-    def _on_run_begin(self, request, response):
-        with self.lock:
-            self._clear_markers()
-        response.success, response.message = True, 'run started'
-        return response
-
+    # ------------------------------------------------------------------ reports
     def _finish(self, report):
-        state = self.check_state if report.check_only else self.run_state
+        state = self._state_of(report.check_only)
         if state is not None:
             report.held_object = next(iter(state.held), '')
         self.report_pub.publish(report)
@@ -424,7 +679,7 @@ def main(args=None):
         print(f'workcell_executor: {exc}')
         rclpy.try_shutdown()
         return 1
-    executor = MultiThreadedExecutor(num_threads=6)
+    executor = MultiThreadedExecutor(num_threads=8)
     executor.add_node(node)
     try:
         _spin(executor)

@@ -35,6 +35,19 @@ class Profile:
         remaining = self.duration - t
         return 1.0 - 0.5 * self.accel * remaining ** 2, self.accel * remaining, -self.accel
 
+    def time_at(self, s):
+        """Return the time at which the motion reaches the fraction s (inverse of at)."""
+        if self.duration <= 0.0 or s >= 1.0:
+            return self.duration
+        if s <= 0.0:
+            return 0.0
+        accel_part = 0.5 * self.accel * self.accel_time ** 2
+        if s < accel_part:
+            return math.sqrt(2.0 * s / self.accel)
+        if s <= 1.0 - accel_part:
+            return self.accel_time + (s - accel_part) / self.peak_rate
+        return self.duration - math.sqrt(2.0 * (1.0 - s) / self.accel)
+
 
 def ptp_profile(start, goal, max_velocity, max_acceleration, speed=1.0):
     """Return the shortest profile that keeps every joint within speed x its limits."""
@@ -131,6 +144,15 @@ def pose_matrix(position, orientation):
     matrix[:3, :3] = quaternion_matrix(*orientation)
     matrix[:3, 3] = position
     return matrix
+
+
+def matrix_rpy(rotation):
+    """Return the fixed-axis roll, pitch, yaw of a rotation matrix."""
+    pitch = math.asin(-max(-1.0, min(1.0, float(rotation[2, 0]))))
+    if abs(math.cos(pitch)) > 1e-9:
+        return (math.atan2(rotation[2, 1], rotation[2, 2]), pitch,
+                math.atan2(rotation[1, 0], rotation[0, 0]))
+    return math.atan2(-rotation[1, 2], rotation[1, 1]), pitch, 0.0   # gimbal lock
 
 
 def inverse(matrix):

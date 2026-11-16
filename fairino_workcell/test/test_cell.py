@@ -3,7 +3,7 @@
 import math
 import os
 
-from fairino_workcell.cell import CellError, load_cell
+from fairino_workcell.cell import CellError, Conveyor, load_cell
 import pytest
 
 EXAMPLE = os.path.join(os.path.dirname(__file__), '..', 'examples', 'conveyor_cell',
@@ -28,15 +28,35 @@ def test_example_cell():
     assert cell.robot.initial_positions[1] == pytest.approx(-math.pi / 2)
     assert cell.robot.tool_file.endswith(os.path.join('example_gripper', 'tool.yaml'))
     names = [obj.name for obj in cell.objects]
-    assert names == ['pedestal', 'conveyor', 'part', 'table', 'fence']
+    assert names == ['pedestal', 'conveyor', 'table', 'fence']
     conveyor = cell.objects[1]
     assert conveyor.geometry.kind == 'mesh' and os.path.isfile(conveyor.geometry.collision)
     assert conveyor.geometry.has_embedded_materials and conveyor.color_given
     assert 'conveyor/station' in cell.frame_names()
     assert cell.objects[0].geometry.size == (0.3, 0.3, 0.75)
     assert cell.objects[0].touch_links == ('base_link', 'shoulder_link')
-    assert cell.objects[2].movable and not cell.objects[1].movable
-    assert cell.objects[2].frame('grasp').xyz == (0.0, 0.0, 0.03)
+    assert conveyor.conveyor == Conveyor(part='part', entry='entry', station='station',
+                                         speed=0.15, spacing=0.30, count=4)
+    part, = cell.parts
+    assert part.name == 'part' and part.movable and part.frame('grasp').xyz == (0.0, 0.0, 0.03)
+    assert not any(obj.movable for obj in cell.objects)
+
+
+def test_movable_objects_and_part_types(tmp_path):
+    cell = load_cell(write_cell(tmp_path, (
+        '  - {name: crate, box: [0.2, 0.2, 0.2], movable: true, '
+        'frames: {grasp: {xyz: [0, 0, 0.2]}}}\n'
+        '  - name: belt\n'
+        '    box: [2, 0.4, 0.8]\n'
+        '    frames: {a: {xyz: [-1, 0, 0.4]}, b: {xyz: [0.5, 0, 0.4]}}\n'
+        '    conveyor: {part: box, entry: a, station: b, speed: 0.2, spacing: 0.3}\n'),
+        robot='robot: {model: fairino5_v6}\n'
+              'parts:\n  - {name: box, cylinder: {radius: 0.05, length: 0.1}, '
+              'frames: {grasp: {xyz: [0, 0, 0.05]}}}\n'))
+    crate, belt = cell.objects
+    assert crate.movable and crate.conveyor is None
+    assert belt.conveyor.count == 0 and belt.conveyor.speed == 0.2
+    assert cell.parts[0].geometry.kind == 'cylinder' and cell.parts[0].pose.xyz == (0, 0, 0)
 
 
 def test_shapes_units_and_defaults(tmp_path):
@@ -98,6 +118,41 @@ def test_invalid_cells_raise_clear_errors(tmp_path, robot, objects, message):
         path = write_cell(tmp_path, objects, robot)
     with pytest.raises(CellError, match=message):
         load_cell(path)
+
+
+PARTS = ('robot: {model: fairino5_v6}\n'
+         'parts:\n  - {name: box, box: [0.1, 0.1, 0.1]}\n')
+BELT = ('  - name: belt\n    box: [2, 0.4, 0.8]\n'
+        '    frames: {a: {xyz: [-1, 0, 0.4]}, b: {xyz: [0.5, 0, 0.4]}}\n'
+        '    conveyor: {%s}\n')
+GOOD = 'part: box, entry: a, station: b, speed: 0.2, spacing: 0.3'
+
+
+@pytest.mark.parametrize('robot, objects, message', [
+    (PARTS, BELT % 'part: crate, entry: a, station: b, speed: 0.2, spacing: 0.3',
+     "part 'crate' is not a part type"),
+    (PARTS, BELT % 'part: box, entry: a, station: c, speed: 0.2, spacing: 0.3',
+     "station 'c' is not a frame of the object"),
+    (PARTS, BELT % 'part: box, entry: a, station: a, speed: 0.2, spacing: 0.3',
+     'entry and station must be at different places'),
+    (PARTS, BELT % 'part: box, entry: a, station: b, speed: 0, spacing: 0.3',
+     'speed must be positive'),
+    (PARTS, BELT % 'part: box, entry: a, station: b, speed: fast, spacing: 0.3',
+     'speed must be a number'),
+    (PARTS, BELT % (GOOD + ', count: -1'), 'count must be a whole number'),
+    (PARTS, BELT % (GOOD + ', count: true'), 'count must be a whole number'),
+    (PARTS, BELT % 'part: box, entry: a, station: b', 'speed, spacing required'),
+    (PARTS, BELT % (GOOD + ', rate: 3'), 'unknown keys'),
+    (PARTS, '  - {name: box, box: [1, 1, 1]}\n', 'both an object and a part type'),
+    (PARTS, '  - {name: box_2, box: [1, 1, 1]}\n', "reserved for the parts of type 'box'"),
+    (PARTS + '  - {name: box, box: [1, 1, 1]}\n', '', "part type 'box' is defined twice"),
+    ('robot: {model: fairino5_v6}\n'
+     'parts:\n  - {name: p, box: [1, 1, 1], pose: {xyz: [0, 0, 1]}}\n', '', 'unknown keys'),
+    ('robot: {model: fairino5_v6}\nparts: {name: p}\n', '', 'parts must be a list'),
+])
+def test_invalid_parts_and_conveyors(tmp_path, robot, objects, message):
+    with pytest.raises(CellError, match=message):
+        load_cell(write_cell(tmp_path, objects, robot))
 
 
 def test_unreadable_files(tmp_path):

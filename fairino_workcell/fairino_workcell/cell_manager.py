@@ -19,13 +19,10 @@ import threading
 import time
 
 from fairino_workcell.cell import CellError, load_cell
+from fairino_workcell.gazebo import Gazebo
 from fairino_workcell.meshes import MeshError
 from fairino_workcell.scene import (allow_collisions, collision_object, gazebo_sdf, markers,
                                     object_color, remove_object, static_transforms)
-from gz.msgs10.boolean_pb2 import Boolean
-from gz.msgs10.entity_factory_pb2 import EntityFactory
-from gz.msgs10.entity_pb2 import Entity
-from gz.transport13 import Node as GzNode
 from moveit_msgs.msg import PlanningScene, PlanningSceneComponents
 from moveit_msgs.srv import ApplyPlanningScene, GetPlanningScene
 import rclpy
@@ -37,41 +34,6 @@ from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf2_msgs.msg import TFMessage
 from visualization_msgs.msg import MarkerArray
-
-GZ_TIMEOUT_MS = 5000
-
-
-class Gazebo:
-    """Spawn and remove static models through the Gazebo world services."""
-
-    def __init__(self, world):
-        self.node = GzNode()
-        self.world = world
-
-    def wait(self, timeout):
-        service = f'/world/{self.world}/create'
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if service in self.node.service_list():
-                return True
-            time.sleep(0.5)
-        return False
-
-    def spawn(self, sdf):
-        request = EntityFactory()
-        request.sdf = sdf
-        request.allow_renaming = False
-        ok, response = self.node.request(f'/world/{self.world}/create', request, EntityFactory,
-                                         Boolean, GZ_TIMEOUT_MS)
-        return ok and response.data
-
-    def remove(self, name):
-        request = Entity()
-        request.name = name
-        request.type = Entity.MODEL
-        ok, response = self.node.request(f'/world/{self.world}/remove', request, Entity,
-                                         Boolean, GZ_TIMEOUT_MS)
-        return ok and response.data
 
 
 class WorkcellManager(Node):

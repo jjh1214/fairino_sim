@@ -4,14 +4,14 @@ Python API for work cell recipes.
 A recipe is a Python function that receives a Workcell::
 
     def recipe(cell):
-        cell.move_joints([0, -90, 0, 0, 0, 0], name='home')            # degrees
-        cell.move_to('part/grasp', xyz=(0, 0, 0.15), name='above part')  # TCP above a cell frame
-        cell.move_to('part/grasp', speed=0.1, allow_contact=['part'], name='pick')
+        cell.move_joints([-45, -90, -90, -90, 90, 0], name='home')        # degrees
+        cell.wait_io('conveyor/part_ready')                               # a part at the station
+        cell.move_to('conveyor/station', xyz=(0, 0, 0.03), allow_contact=['part'], name='pick')
         cell.grip()
 
 Run it in the simulation, or with --check to validate every step without moving the robot::
 
-    ros2 run fairino_workcell run_recipe my_recipe.py [--check] [--report report.json]
+    ros2 run fairino_workcell run_recipe my_recipe.py [--check] [--reset] [--report report.json]
 
 Every step is checked before it runs and returns a report (a dict). A failed step raises
 RecipeError unless stop_on_failure is False. Workcell only uses the ROS interfaces of
@@ -28,20 +28,18 @@ import math
 import os
 import sys
 import threading
-import time
 
 from action_msgs.msg import GoalStatus
 from fairino_workcell.cell import load_cell
 from fairino_workcell.motion import matrix_quaternion, pose_matrix, rpy_matrix
 from fairino_workcell.robot_cell import DEFAULT_SPEED, new_report, RobotCell, StepError
 from fairino_workcell_msgs.action import Move
-from fairino_workcell_msgs.msg import IOState, StepReport
-from fairino_workcell_msgs.srv import Gripper, SetIO
+from fairino_workcell_msgs.msg import StepReport
+from fairino_workcell_msgs.srv import Gripper, SetIO, Wait
 from geometry_msgs.msg import PoseStamped
 import rclpy
 from rclpy.action import ActionClient
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_srvs.srv import Trigger
 
 STATUS = {StepReport.OK: 'OK', StepReport.WARNING: 'WARNING', StepReport.FAILED: 'FAILED'}
@@ -60,7 +58,7 @@ def report_dict(msg):
     return {
         'name': msg.name, 'kind': msg.kind, 'status': STATUS[msg.status],
         'message': msg.message, 'check_only': msg.check_only,
-        'duration': round(msg.duration, 3),
+        'start_time': round(msg.start_time, 3), 'duration': round(msg.duration, 3),
         'min_clearance': round(msg.min_clearance, 4) if msg.min_clearance >= 0 else None,
         'closest_link': msg.closest_link, 'closest_object': msg.closest_object,
         'collisions': list(msg.collisions),
@@ -75,7 +73,9 @@ def report_dict(msg):
 class Workcell:
     """Client of the work cell executor; one instance per recipe run."""
 
-    def __init__(self, check_only=False, speed=None, stop_on_failure=True, timeout=30.0):
+    def __init__(self, check_only=False, speed=None, stop_on_failure=True, timeout=30.0,
+                 reset=False):
+        """Connect to the executor; reset first puts the cell back to its start."""
         self._start_run('check' if check_only else 'simulation', speed, stop_on_failure)
         self._own_context = not rclpy.ok()
         if self._own_context:
@@ -85,26 +85,24 @@ class Workcell:
         self._executor.add_node(self.node)
         self._thread = threading.Thread(target=self._spin, daemon=True)
         self._thread.start()
-        self._io = {}
-        self._io_changed = threading.Condition()
-        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
-                             reliability=ReliabilityPolicy.RELIABLE)
-        self.node.create_subscription(IOState, '/workcell/io', self._on_io, latched)
         self._move = ActionClient(self.node, Move, '/workcell/move')
         self._gripper = self.node.create_client(Gripper, '/workcell/gripper')
+        self._wait_service = self.node.create_client(Wait, '/workcell/wait')
         self._set_io = self.node.create_client(SetIO, '/workcell/set_io')
         if not (self._move.wait_for_server(timeout_sec=timeout)
                 and self._gripper.wait_for_service(timeout_sec=timeout)):
             self.close()
             raise RuntimeError('the work cell executor is not running; start '
                                'fairino_workcell.launch.py first')
-        begin = self.node.create_client(
-            Trigger, '/workcell/check/begin' if check_only else '/workcell/run/begin')
-        response = self._call(begin, Trigger.Request())
-        if response is None or not response.success:
-            self.close()
-            raise RuntimeError(f'could not start the {self.mode}: '
-                               + (response.message if response else 'no answer'))
+        services = (['/workcell/reset'] if reset else []) + [
+            '/workcell/check/begin' if check_only else '/workcell/run/begin']
+        for service in services:
+            response = self._call(self.node.create_client(Trigger, service), Trigger.Request())
+            if response is None or not response.success:
+                self.close()
+                raise RuntimeError(f'{service} failed: '
+                                   + (response.message if response else 'no answer'))
+        self._started = True
 
     def _start_run(self, mode, speed, stop_on_failure):
         self.mode = mode
@@ -112,7 +110,6 @@ class Workcell:
         self.speed = speed
         self.stop_on_failure = stop_on_failure
         self.reports = []
-        self.waits = 0.0
         self.on_step = None     # called with (step number, report) after every step
 
     # ------------------------------------------------------------------ steps
@@ -151,42 +148,41 @@ class Workcell:
         """Open the gripper and leave the held object where it is."""
         return self._gripper_step(False, name or 'release')
 
-    def set_io(self, name, value):
-        """Set a virtual digital output (no effect in a check run)."""
-        if self.check_only:
-            return True
-        response = self._call(self._set_io, SetIO.Request(name=name, value=bool(value)))
-        return bool(response and response.success)
+    def set_io(self, io, value, name=None):
+        """Set a virtual IO, such as an output to another machine (check: in the session only)."""
+        return self._record(self._send_set_io(io, bool(value), name or f'set {io}'))
 
-    def wait_io(self, name, value=True, timeout=None):
-        """Wait until a virtual IO has the value (returns at once in a check run)."""
-        if self.check_only:
-            return True
-        deadline = None if timeout is None else time.monotonic() + timeout
-        with self._io_changed:
-            while self._io.get(name) != value:
-                remaining = None if deadline is None else deadline - time.monotonic()
-                if remaining is not None and remaining <= 0:
-                    return False
-                self._io_changed.wait(remaining if remaining is not None else 0.5)
-        return True
+    def wait_io(self, io, value=True, timeout=None, name=None):
+        """
+        Wait until a virtual IO has the value, such as 'conveyor/part_ready'.
 
-    def wait(self, seconds):
-        """Wait (counted in the cycle time; not slept in a check run)."""
-        self.waits += seconds
-        if not self.check_only:
-            time.sleep(seconds)
+        Conveyor sensors are simulated, also in a check. IO that other programs set is
+        assumed in a check. A timeout (seconds) fails the step when it expires.
+        """
+        return self._record(self._send_wait(io, bool(value), float(timeout or 0.0),
+                                            name or f'wait {io}'))
+
+    def wait(self, seconds, name=None):
+        """Wait for a time (virtual in a check); conveyors run on meanwhile."""
+        return self._record(self._send_wait('', True, float(seconds), name or 'wait'))
 
     # ------------------------------------------------------------------ reports
     @property
     def cycle_time(self):
-        return sum(r['duration'] for r in self.reports) + self.waits
+        return sum(r['duration'] for r in self.reports)
 
     def summary(self):
+        """Return counts and times of the run: cycle time, waiting, parts gripped."""
         counts = {status: sum(r['status'] == status for r in self.reports)
                   for status in STATUS.values()}
-        return {'mode': self.mode,
-                'cycle_time': round(self.cycle_time, 3), 'waits': round(self.waits, 3),
+        grips = [r['start_time'] for r in self.reports if r['kind'] == 'grip'
+                 and r['status'] != 'FAILED']
+        intervals = [b - a for a, b in zip(grips, grips[1:])]
+        return {'mode': self.mode, 'cycle_time': round(self.cycle_time, 3),
+                'waiting': round(sum(r['duration'] for r in self.reports
+                                     if r['kind'] == 'wait'), 3),
+                'grips': len(grips),
+                'grip_interval': round(sum(intervals) / len(intervals), 3) if intervals else None,
                 'steps': len(self.reports), **{k.lower(): v for k, v in counts.items()}}
 
     def report_header(self):
@@ -194,7 +190,7 @@ class Workcell:
         title = {'simulation': 'simulation', 'check': 'check only, the robot did not move',
                  'offline': 'offline check against the cell file'}[self.mode]
         return (f'Recipe report ({title})\n'
-                f"{'#':>3}  {'step':<16}{'kind':<9}{'result':<9}{'time':>7}  {'clearance':>9}  "
+                f"{'#':>3}  {'step':<19}{'kind':<9}{'result':<9}{'time':>7}  {'clearance':>9}  "
                 f"{'closest':<26}message")
 
     @staticmethod
@@ -202,13 +198,18 @@ class Workcell:
         """Return the report table row of a step."""
         clearance = '-' if r['min_clearance'] is None else f"{r['min_clearance'] * 1000:.0f} mm"
         closest = f"{r['closest_link']} / {r['closest_object']}" if r['closest_object'] else ''
-        return (f"{index:>3}  {r['name'][:15]:<16}{r['kind']:<9}{r['status']:<9}"
+        return (f"{index:>3}  {r['name'][:18]:<19}{r['kind']:<9}{r['status']:<9}"
                 f"{r['duration']:>6.2f}s  {clearance:>9}  {closest[:25]:<26}{r['message']}")
 
     def report_summary(self):
         s = self.summary()
-        return (f"Cycle time {s['cycle_time']:.2f} s | {s['steps']} steps: {s['ok']} OK, "
+        text = (f"Cycle time {s['cycle_time']:.2f} s | {s['steps']} steps: {s['ok']} OK, "
                 f"{s['warning']} warnings, {s['failed']} failed")
+        if s['waiting']:
+            text += f" | waiting {s['waiting']:.2f} s"
+        if s['grip_interval'] is not None:
+            text += f" | {s['grips']} parts gripped, one every {s['grip_interval']:.2f} s"
+        return text
 
     def print_report(self, stream=sys.stdout):
         print('\n' + self.report_header(), file=stream)
@@ -249,6 +250,22 @@ class Workcell:
             raise RuntimeError(f"step '{name}' got no answer from the executor")
         return response.report
 
+    def _send_wait(self, io, value, seconds, name):
+        request = Wait.Request(io=io, value=value, seconds=seconds, check_only=self.check_only,
+                               name=name)
+        timeout = None if self.mode == 'simulation' else 120.0   # the simulation may wait long
+        response = self._call(self._wait_service, request, timeout)
+        if response is None:
+            raise RuntimeError(f"step '{name}' got no answer from the executor")
+        return response.report
+
+    def _send_set_io(self, io, value, name):
+        response = self._call(self._set_io, SetIO.Request(
+            io=io, value=value, check_only=self.check_only, name=name))
+        if response is None:
+            raise RuntimeError(f"step '{name}' got no answer from the executor")
+        return response.report
+
     def _record(self, msg):
         report = report_dict(msg)
         self.reports.append(report)
@@ -259,7 +276,7 @@ class Workcell:
         return report
 
     def _call(self, client, request, timeout=30.0):
-        if not client.wait_for_service(timeout_sec=timeout):
+        if not client.wait_for_service(timeout_sec=30.0):
             return None
         return self._wait(client.call_async(request), timeout)
 
@@ -269,11 +286,6 @@ class Workcell:
         future.add_done_callback(lambda _: done.set())
         return future.result() if done.wait(timeout) else None
 
-    def _on_io(self, msg):
-        with self._io_changed:
-            self._io = dict(zip(msg.names, msg.values))
-            self._io_changed.notify_all()
-
     def _spin(self):
         try:
             self._executor.spin()
@@ -281,7 +293,13 @@ class Workcell:
             pass
 
     def close(self):
-        self._executor.shutdown()
+        """End the run (the conveyors run freely again) and disconnect."""
+        if self.mode == 'simulation' and getattr(self, '_started', False):
+            self._started = False
+            self._call(self.node.create_client(Trigger, '/workcell/run/end'), Trigger.Request(),
+                       5.0)
+        self._executor.shutdown(timeout_sec=5.0)
+        self._thread.join(timeout=5.0)      # spin must return before the node goes away
         self.node.destroy_node()
         if self._own_context:
             rclpy.try_shutdown()
@@ -298,8 +316,8 @@ class OfflineWorkcell(Workcell):
     Check a recipe against a cell file without ROS or the simulation.
 
     The steps follow the same rules as in workcell_executor (see fairino_workcell.robot_cell),
-    from the initial joints of the cell file unless joints (radians) are given. IO steps are
-    skipped, like in a check run.
+    from the start of the cell (initial joints unless joints in radians are given), in virtual
+    time like a check session.
     """
 
     def __init__(self, cell_file, speed=None, stop_on_failure=True, joints=None, **settings):
@@ -308,8 +326,7 @@ class OfflineWorkcell(Workcell):
         self.state = self.core.initial_state(joints)
 
     def _send_move(self, goal):
-        report = new_report(goal.name, 'move', True)
-        report.start_joints = list(self.state.joints)
+        report = self._report(goal.name, 'move')
         try:
             if goal.target_type == Move.Goal.JOINTS:
                 target = tuple(goal.joints)
@@ -320,14 +337,14 @@ class OfflineWorkcell(Workcell):
             plan = self.core.plan_move(self.state, target, goal.speed or DEFAULT_SPEED,
                                        goal.allowed_contacts, report)
             if report.status != StepReport.FAILED:
+                self.core.advance(self.state, plan.profile.duration)
                 self.core.complete_move(self.state, plan.goal)
         except StepError as exc:
             report.status, report.message = StepReport.FAILED, str(exc)
         return self._finish(report)
 
     def _send_gripper(self, close, name):
-        report = new_report(name, 'grip' if close else 'release', True)
-        report.start_joints = list(self.state.joints)
+        report = self._report(name, 'grip' if close else 'release')
         try:
             if close:
                 self.core.grip(self.state, report)
@@ -336,6 +353,29 @@ class OfflineWorkcell(Workcell):
         except StepError as exc:
             report.status, report.message = StepReport.FAILED, str(exc)
         return self._finish(report)
+
+    def _send_wait(self, io, value, seconds, name):
+        report = self._report(name, 'wait')
+        try:
+            plan = self.core.plan_wait(self.state, report, io, value, seconds, check_only=True)
+            if report.status != StepReport.FAILED:
+                self.core.advance(self.state, plan.duration)
+        except StepError as exc:
+            report.status, report.message = StepReport.FAILED, str(exc)
+        return self._finish(report)
+
+    def _send_set_io(self, io, value, name):
+        report = self._report(name, 'io')
+        try:
+            self.core.set_io(self.state, io, value, report)
+        except StepError as exc:
+            report.status, report.message = StepReport.FAILED, str(exc)
+        return self._finish(report)
+
+    def _report(self, name, kind):
+        report = new_report(name, kind, True, self.state.time)
+        report.start_joints = list(self.state.joints)
+        return report
 
     def _finish(self, report):
         report.end_joints = list(self.state.joints)
@@ -361,6 +401,8 @@ def run(recipe, argv=None):
     parser.add_argument('--report', help='write the report to this JSON file')
     parser.add_argument('--keep-going', action='store_true',
                         help='continue after a failed step (check runs)')
+    parser.add_argument('--reset', action='store_true',
+                        help='first put the cell back to its start (objects, parts, conveyors)')
     args = parser.parse_args(argv)
     code = 0
     if args.offline:
@@ -368,7 +410,7 @@ def run(recipe, argv=None):
                                stop_on_failure=not args.keep_going)
     else:
         cell = Workcell(check_only=args.check, speed=args.speed,
-                        stop_on_failure=not args.keep_going)
+                        stop_on_failure=not args.keep_going, reset=args.reset)
     with cell:
         print(cell.report_header(), flush=True)     # the rows follow as the steps finish
         cell.on_step = lambda index, report: print(cell.report_row(index, report), flush=True)
@@ -392,8 +434,8 @@ def main(argv=None):
     """Entry point of run_recipe: load a recipe file and run its recipe(cell) function."""
     argv = sys.argv[1:] if argv is None else argv
     if not argv or argv[0].startswith('-'):
-        print('usage: run_recipe RECIPE.py [--check | --offline CELL_FILE] [--speed S] '
-              '[--report FILE] [--keep-going]', file=sys.stderr)
+        print('usage: run_recipe RECIPE.py [--check | --offline CELL_FILE] [--reset] '
+              '[--speed S] [--report FILE] [--keep-going]', file=sys.stderr)
         return 2
     path = os.path.abspath(argv[0])
     spec = importlib.util.spec_from_file_location('workcell_recipe', path)

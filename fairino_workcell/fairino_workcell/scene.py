@@ -202,11 +202,16 @@ def gazebo_sdf(obj):
 
 def markers(cell, namespace='workcell'):
     """Return RViz markers showing the visual geometry of every cell object."""
+    return object_markers(cell.objects, namespace)
+
+
+def object_markers(objects, namespace):
+    """Return RViz markers of objects, each following the TF frame named after it."""
     array = MarkerArray()
     clear = Marker()
     clear.action = Marker.DELETEALL
     array.markers.append(clear)
-    for index, obj in enumerate(cell.objects):
+    for index, obj in enumerate(objects):
         marker = Marker()
         marker.header.frame_id = obj.name   # follows the object when it moves
         marker.frame_locked = True

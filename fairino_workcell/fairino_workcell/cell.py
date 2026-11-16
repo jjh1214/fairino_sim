@@ -1,12 +1,13 @@
 """
 Load and validate a work cell file (cell.yaml).
 
-A cell describes the robot (model, base pose, initial joint angles, tool) and the equipment
-around it (meshes or primitive shapes, their poses and named frames). Relative paths are
-resolved against the directory of the cell file.
+A cell describes the robot (model, base pose, initial joint angles, tool), the equipment
+around it (meshes or primitive shapes, their poses and named frames) and the types of parts
+that conveyors put into the cell. Relative paths are resolved against the directory of the
+cell file.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 import os
 import re
@@ -15,10 +16,12 @@ from fairino_sim import description
 import yaml
 
 NAME_PATTERN = re.compile(r'^[A-Za-z][A-Za-z0-9_]*$')
-CELL_KEYS = ('cell', 'robot', 'objects')
+CELL_KEYS = ('cell', 'robot', 'parts', 'objects')
 ROBOT_KEYS = ('model', 'base', 'initial_positions', 'initial_positions_deg', 'tool')
-OBJECT_KEYS = ('name', 'visual', 'collision', 'units', 'box', 'cylinder', 'pose', 'color',
-               'frames', 'touch_links', 'movable')
+SHAPE_KEYS = ('name', 'visual', 'collision', 'units', 'box', 'cylinder', 'color', 'frames')
+OBJECT_KEYS = SHAPE_KEYS + ('pose', 'touch_links', 'movable', 'conveyor')
+PART_KEYS = SHAPE_KEYS
+CONVEYOR_KEYS = ('part', 'entry', 'station', 'speed', 'spacing', 'count')
 VISUAL_FORMATS = ('.glb', '.gltf', '.dae', '.obj', '.stl')
 EMBEDDED_MATERIAL_FORMATS = ('.glb', '.gltf', '.dae')
 DEFAULT_COLOR = (0.62, 0.64, 0.68, 1.0)
@@ -53,8 +56,20 @@ class Geometry:
 
 
 @dataclass(frozen=True)
+class Conveyor:
+    """An index conveyor: parts travel from the entry frame to the station frame and stop."""
+
+    part: str          # part type put on the belt
+    entry: str         # frame of the object where parts are put on the belt
+    station: str       # frame of the object where parts stop
+    speed: float       # belt speed [m/s]
+    spacing: float     # distance between parts on the belt [m]
+    count: int = 0     # parts to put on the belt; 0: no limit
+
+
+@dataclass(frozen=True)
 class CellObject:
-    """A piece of equipment in the cell."""
+    """A piece of equipment in the cell, or a part type (a template for parts)."""
 
     name: str
     geometry: Geometry
@@ -64,6 +79,7 @@ class CellObject:
     frames: tuple
     touch_links: tuple
     movable: bool = False
+    conveyor: Conveyor = None
 
     def frame(self, name):
         """Return the Pose of a named frame of the object, or None."""
@@ -88,6 +104,7 @@ class Cell:
     path: str
     robot: Robot
     objects: tuple
+    parts: tuple = ()      # part types (movable, put into the cell by conveyors)
 
     def frame_names(self):
         """Return every TF frame the cell publishes."""
@@ -103,6 +120,16 @@ def frame_id(object_name, frame_name):
     return f'{object_name}/{frame_name}'
 
 
+def ready_io(conveyor_name):
+    """Return the name of the IO that is true while a part waits at the conveyor station."""
+    return f'{conveyor_name}/part_ready'
+
+
+def part_name(part_type, number):
+    """Return the name of the n-th part of a type put into the cell (part_1, part_2, ...)."""
+    return f'{part_type}_{number}'
+
+
 def load_cell(path):
     """Load and validate a cell file; raise CellError with the location of any problem."""
     path = os.path.abspath(os.path.expanduser(path))
@@ -112,18 +139,36 @@ def load_cell(path):
     robot = _load_robot(data.get('robot'), base_dir, path)
     links = description.robot_links(robot.model)
 
-    items = data.get('objects') or []
-    if not isinstance(items, list):
-        raise CellError(f'{path}: objects must be a list')
+    parts = []
+    for index, item in enumerate(_list(data, 'parts', path)):
+        part = _load_shape(item, path, f'parts[{index}]', 'part', PART_KEYS, base_dir, links)
+        if part.name in [p.name for p in parts]:
+            raise CellError(f'{path}: part type {part.name!r} is defined twice')
+        parts.append(part)
+    part_types = {part.name for part in parts}
+
     objects, names = [], set()
-    for index, item in enumerate(items):
-        obj = _load_object(item, index, base_dir, links, path)
+    for index, item in enumerate(_list(data, 'objects', path)):
+        obj = _load_object(item, index, base_dir, links, path, part_types)
         if obj.name in names:
             raise CellError(f'{path}: object name {obj.name!r} is used twice')
+        if obj.name in part_types:
+            raise CellError(f'{path}: {obj.name!r} is both an object and a part type')
+        instance = re.match(r'^(.+)_[0-9]+$', obj.name)
+        if instance and instance.group(1) in part_types:
+            raise CellError(f'{path}: object name {obj.name!r} is reserved for the parts of '
+                            f'type {instance.group(1)!r}')
         names.add(obj.name)
         objects.append(obj)
     return Cell(name=str(data.get('cell') or os.path.basename(base_dir)), path=path,
-                robot=robot, objects=tuple(objects))
+                robot=robot, objects=tuple(objects), parts=tuple(parts))
+
+
+def _list(data, key, path):
+    items = data.get(key) or []
+    if not isinstance(items, list):
+        raise CellError(f'{path}: {key} must be a list')
+    return items
 
 
 def _read_yaml(path):
@@ -199,16 +244,32 @@ def _tool_file(value, base_dir, where):
     return tool_file
 
 
-def _load_object(item, index, base_dir, links, path):
-    where = f'{path}: objects[{index}]'
+def _load_object(item, index, base_dir, links, path, part_types):
+    obj = _load_shape(item, path, f'objects[{index}]', 'object', OBJECT_KEYS, base_dir, links)
+    where = f'{path}: object {obj.name!r}'
+    frames = dict(obj.frames)
+    conveyor = None
+    if 'conveyor' in item:
+        conveyor = _conveyor(item['conveyor'], frames, part_types, where)
+    return replace(
+        obj,
+        pose=_pose(item.get('pose'), 'pose', where),
+        touch_links=_touch_links(item.get('touch_links'), links, where),
+        movable=_flag(item.get('movable', False), 'movable', where),
+        conveyor=conveyor)
+
+
+def _load_shape(item, path, label, kind, keys, base_dir, links):
+    """Load what objects and part types share: name, shape, colour and frames."""
+    where = f'{path}: {label}'
     if not isinstance(item, dict):
         raise CellError(f'{where} must be a mapping')
-    _check_keys(item, OBJECT_KEYS, where)
+    _check_keys(item, keys, where)
     name = item.get('name')
     if not isinstance(name, str) or not NAME_PATTERN.match(name):
         raise CellError(f'{where}: name must start with a letter and contain only letters, '
                         'digits and _')
-    where = f'{path}: object {name!r}'
+    where = f'{path}: {kind} {name!r}'
     if name in links:
         raise CellError(f'{where}: the name is already a frame of the robot')
 
@@ -232,13 +293,44 @@ def _load_object(item, index, base_dir, links, path):
     return CellObject(
         name=name,
         geometry=geometry,
-        pose=_pose(item.get('pose'), 'pose', where),
+        pose=Pose(),
         color=_color(item.get('color'), where),
         color_given='color' in item,
         frames=_frames(item.get('frames'), where),
-        touch_links=_touch_links(item.get('touch_links'), links, where),
-        movable=_flag(item.get('movable', False), 'movable', where),
+        touch_links=(),
+        movable=kind == 'part',
     )
+
+
+def _conveyor(data, frames, part_types, where):
+    where = f'{where}: conveyor'
+    if not isinstance(data, dict):
+        raise CellError(f'{where} must be a mapping')
+    _check_keys(data, CONVEYOR_KEYS, where)
+    missing = [key for key in ('part', 'entry', 'station', 'speed', 'spacing') if key not in data]
+    if missing:
+        raise CellError(f'{where}: {", ".join(missing)} required')
+    if data['part'] not in part_types:
+        raise CellError(f"{where}: part {data['part']!r} is not a part type (see parts)")
+    for key in ('entry', 'station'):
+        if data[key] not in frames:
+            raise CellError(f'{where}: {key} {data[key]!r} is not a frame of the object')
+    entry, station = frames[data['entry']].xyz, frames[data['station']].xyz
+    if math.dist(entry, station) < 1e-3:
+        raise CellError(f'{where}: entry and station must be at different places')
+    values = {}
+    for key in ('speed', 'spacing'):
+        try:
+            values[key] = float(data[key])
+        except (TypeError, ValueError):
+            raise CellError(f'{where}: {key} must be a number') from None
+        if values[key] <= 0:
+            raise CellError(f'{where}: {key} must be positive')
+    count = data.get('count', 0)
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise CellError(f'{where}: count must be a whole number, 0 for no limit')
+    return Conveyor(part=data['part'], entry=data['entry'], station=data['station'],
+                    speed=values['speed'], spacing=values['spacing'], count=count)
 
 
 def _flag(value, what, where):

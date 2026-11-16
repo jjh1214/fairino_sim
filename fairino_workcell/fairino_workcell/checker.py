@@ -12,6 +12,8 @@ each question with its own allowed collision matrix (ACM):
   makes moveit_py report the distance to the environment.
 
 Colliding and closest pairs are named by repeating a check with one object or body enabled.
+Objects that move during a motion (parts on a running conveyor) are moved in the scene for every
+sample of the motion, and their clearance copies for the samples where clearance is computed.
 """
 
 from dataclasses import dataclass, field
@@ -23,7 +25,7 @@ from fairino_workcell import motion
 from fairino_workcell.cell import Pose
 from fairino_workcell.scene import collision_object, pose_msg
 from moveit.core import collision_detection, planning_scene, robot_model
-from moveit_msgs.msg import AttachedCollisionObject
+from moveit_msgs.msg import AttachedCollisionObject, CollisionObject
 import numpy as np
 
 COPY_SUFFIX = '__clearance'
@@ -65,26 +67,33 @@ class Checker:
         self.tool_bodies = list(tool_bodies)
         self.objects = {obj.name: obj for obj in cell.objects}
         self.touch = {(obj.name, link) for obj in cell.objects for link in obj.touch_links}
-        self._synced = None
+        self.definitions = dict(self.objects)    # name -> CellObject, also for parts
+        self._messages = {}                      # name -> CollisionObject (shape and frames)
+        self._layout = None
+        self._world_poses, self._copy_poses = {}, {}
         self.held = {}
         self.world = []
 
     # ---------------------------------------------------------------- scene
-    def sync(self, object_poses, held, held_touch_links):
+    def sync(self, object_poses, held, held_touch_links, definitions=None):
         """
-        Rebuild the scene for the given object poses and held objects.
+        Set up the scene for the given object poses and held objects.
 
-        object_poses maps object -> 4x4 world pose; held maps object -> 4x4 pose relative to
-        the TCP, for the objects in the gripper.
+        object_poses maps every object in the world -> 4x4 world pose; held maps object -> 4x4
+        pose relative to the TCP, for the objects in the gripper. definitions maps the names
+        of objects that are not in the cell file (parts) to their CellObject. When only poses
+        changed since the last call, the objects are moved instead of building a new scene.
         """
-        key = (tuple(sorted((n, p.tobytes()) for n, p in object_poses.items())),
-               tuple(sorted((n, p.tobytes()) for n, p in held.items())))
-        if key == self._synced and Checker._world_owner is self:
+        self.definitions.update(definitions or {})
+        layout = (tuple(sorted(object_poses)), tuple(held_touch_links),
+                  tuple(sorted((n, p.tobytes()) for n, p in held.items())))
+        if layout == self._layout and Checker._world_owner is self:
+            self._place(object_poses, copies=True)
             return
         self.scene = planning_scene.PlanningScene(self.model)
         self.scene.remove_all_collision_objects()   # the collision world is shared
         self.held = {name: list(held_touch_links) for name in held}
-        self.world = [name for name in self.objects if name not in held]
+        self.world = [name for name in object_poses if name not in held]
         for name in self.world:
             self.scene.apply_collision_object(self._object(name, 'world', object_poses[name]))
             copy = AttachedCollisionObject(link_name='world')
@@ -95,15 +104,42 @@ class Checker:
             attached.object = self._object(name, 'tcp', pose)
             self.scene.process_attached_collision_object(attached)
         self.state = self.scene.current_state
-        self._synced = key
+        self._world_poses = {name: np.array(object_poses[name]) for name in self.world}
+        self._copy_poses = dict(self._world_poses)
+        self._layout = layout
         Checker._world_owner = self
 
-    def _object(self, name, frame, matrix, object_id=None):
-        msg = collision_object(self.objects[name])
-        msg.id = object_id or name
+    def _object(self, name, frame, matrix, object_id=None, operation=CollisionObject.ADD):
+        msg = CollisionObject(id=object_id or name, operation=operation)
+        if operation == CollisionObject.ADD:
+            if name not in self._messages:
+                self._messages[name] = collision_object(self.definitions[name])
+            shape = self._messages[name]
+            msg.primitives, msg.primitive_poses = shape.primitives, shape.primitive_poses
+            msg.meshes, msg.mesh_poses = shape.meshes, shape.mesh_poses
+            msg.subframe_names, msg.subframe_poses = shape.subframe_names, shape.subframe_poses
         msg.header.frame_id = frame
         msg.pose = pose_msg(_pose(matrix))
         return msg
+
+    def _place(self, poses, copies):
+        """Move world objects (and, with copies, their clearance copies) to new poses."""
+        for name, pose in poses.items():
+            if name not in self._world_poses:
+                continue
+            if not np.array_equal(self._world_poses[name], pose):
+                self.scene.apply_collision_object(
+                    self._object(name, 'world', pose, operation=CollisionObject.MOVE))
+                self._world_poses[name] = np.array(pose)
+            if copies and not np.array_equal(self._copy_poses[name], pose):
+                remove = AttachedCollisionObject(link_name='world')
+                remove.object.id = name + COPY_SUFFIX
+                remove.object.operation = CollisionObject.REMOVE
+                self.scene.process_attached_collision_object(remove)
+                copy = AttachedCollisionObject(link_name='world')
+                copy.object = self._object(name, 'world', pose, name + COPY_SUFFIX)
+                self.scene.process_attached_collision_object(copy)
+                self._copy_poses[name] = np.array(pose)
 
     # ---------------------------------------------------------------- ACMs
     def _bodies(self):
@@ -227,36 +263,62 @@ class Checker:
                    clearance_every=8):
         """Check the joint-space line from start to goal; stop at the first collision."""
         start, goal = np.asarray(start, dtype=float), np.asarray(goal, dtype=float)
-        result = PathCheck(end_joints=tuple(goal))
-        fractions = motion.path_fractions(start, goal, step)
+        samples = [(float(f), start + f * (goal - start), {})
+                   for f in motion.path_fractions(start, goal, step)]
+        return self.check_motion(samples, allowed_pairs, clearance_every)
+
+    def check_motion(self, samples, allowed_pairs=(), clearance_every=8):
+        """
+        Check a motion given as samples (at, joints, poses of the objects that moved).
+
+        'at' locates a sample in the motion (a path or time fraction) and is reported as
+        collision_at. The moving objects must be in the scene (see sync); each sample moves
+        the objects whose pose changed. Stop at the first collision.
+        """
+        allowed_pairs = set(allowed_pairs)
+        result = PathCheck(end_joints=tuple(samples[-1][1]))
+        initial = {name: pose.copy() for name, pose in self._world_poses.items()}
+        moving = {}               # latest pose of every object that moved so far
+
+        def go_to(index, copies):
+            """Put the robot and every object where they are at sample index."""
+            poses = dict(initial)
+            for previous in samples[:index + 1]:
+                poses.update(previous[2])
+            self._place(poses, copies)
+            self.set_joints(samples[index][1])
+
         distances = {}
-        for index, fraction in enumerate(fractions):
-            joints = start + fraction * (goal - start)
+        for index, (at, joints, moved) in enumerate(samples):
+            moving.update(moved)
+            self._place(moved, copies=False)
             self.set_joints(joints)
             result.tcp_path.append(tuple(self.link_pose('tcp')[:3, 3]))
             if self.in_collision(allowed_pairs):
-                result.collision_at = float(fraction)
+                result.collision_at = float(at)
                 result.collisions = self.collisions(allowed_pairs)
                 result.min_clearance = 0.0
                 return result
-            if index % clearance_every == 0 or index == len(fractions) - 1:
-                distances[index] = self._check(self._clearance_acm(set(allowed_pairs)),
-                                               distance=True)[1]
+            if index % clearance_every == 0 or index == len(samples) - 1:
+                self._place(moving, copies=True)
+                distances[index] = self._distance(allowed_pairs)
         if not distances or min(distances.values()) > 1e9:
             return result
         best = min(distances, key=distances.get)
         window = range(max(0, best - clearance_every),
-                       min(len(fractions), best + clearance_every + 1))
+                       min(len(samples), best + clearance_every + 1))
         for index in window:
             if index not in distances:
-                self.set_joints(start + fractions[index] * (goal - start))
-                distances[index] = self._check(self._clearance_acm(set(allowed_pairs)),
-                                               distance=True)[1]
+                go_to(index, copies=True)
+                distances[index] = self._distance(allowed_pairs)
         best = min(distances, key=distances.get)
-        self.set_joints(start + fractions[best] * (goal - start))
+        go_to(best, copies=True)
         result.min_clearance, result.closest_body, result.closest_object = self.clearance(
             allowed_pairs)
         return result
+
+    def _distance(self, allowed_pairs):
+        return self._check(self._clearance_acm(allowed_pairs), distance=True)[1]
 
 
 def _pose(matrix):

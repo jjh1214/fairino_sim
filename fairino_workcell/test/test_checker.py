@@ -1,5 +1,6 @@
 """Tests of the moveit_py path checker with the example cell (needs moveit_py)."""
 
+from dataclasses import replace
 import math
 import os
 
@@ -15,6 +16,7 @@ EXAMPLE = os.path.join(os.path.dirname(__file__), '..', 'examples', 'conveyor_ce
 HOME = [0.0, -math.pi / 2, 0.0, 0.0, 0.0, 0.0]
 ABOVE_PART = [-1.3998, -1.8346, -1.5979, -1.2799, 1.5708, -2.9706]
 INSIDE_CONVEYOR = [1.3998, -1.013, 1.8508, -2.4087, -1.5708, 2.9706]
+STATION = motion.transform((0.0, -0.6, 0.8))          # where parts stop on the conveyor
 
 
 @pytest.fixture(scope='module')
@@ -76,15 +78,33 @@ def test_check_path(setup):
 
 def test_held_part_touches_its_support(setup):
     checker, poses = setup
+    part = {'part_1': replace(checker.cell.parts[0], name='part_1')}
     free(checker, poses)
     tcp = checker.tcp_pose(ABOVE_PART)
-    offset = motion.inverse(tcp) @ poses['part']
-    others = {name: pose for name, pose in poses.items() if name != 'part'}
-    checker.sync(others, {'part': offset}, ['tcp', 'tool_link', 'wrist3_link'])
+    offset = motion.inverse(tcp) @ STATION
+    checker.sync(poses, {'part_1': offset}, ['tcp', 'tool_link', 'wrist3_link'], part)
     checker.set_joints(ABOVE_PART)
-    assert checker.touching('part') == ['conveyor']
+    assert checker.touching('part_1') == ['conveyor']
     assert checker.in_collision()
-    assert not checker.in_collision(allowed_pairs={('part', 'conveyor')})
+    assert not checker.in_collision(allowed_pairs={('part_1', 'conveyor')})
     checker.set_joints(HOME)
     assert not checker.in_collision()
     assert np.isfinite(checker.clearance()[0])
+
+
+def test_moving_objects_are_checked_at_every_sample(setup):
+    checker, poses = setup
+    part = {'part_1': replace(checker.cell.parts[0], name='part_1')}
+
+    def sliding(z):
+        """Slide a part along the belt direction under the TCP, at height z."""
+        path = [motion.transform((-0.5 + 0.01 * i, -0.6, z)) for i in range(51)]
+        checker.sync(dict(poses, part_1=path[0]), {}, [], part)
+        return checker.check_motion([(i / 50, ABOVE_PART, {'part_1': pose})
+                                     for i, pose in enumerate(path)])
+
+    hit = sliding(0.95)                   # at the height of the fingers
+    assert hit.collisions == ['tool_link <-> part_1'] and 0.8 < hit.collision_at < 1.0
+    passing = sliding(0.86)               # 5 cm below the fingers
+    assert passing.collision_at == -1.0 and passing.closest_object == 'part_1'
+    assert 0.03 < passing.min_clearance < 0.07
