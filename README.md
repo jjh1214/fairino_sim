@@ -110,6 +110,7 @@ Gazebo, MoveIt and RViz all use the same robot description, which adds these fra
 | `flange` | Tool mounting face at the end of `wrist3_link` |
 | `tool_link` | The tool body (only when a tool is given) |
 | `tcp` | Tool centre point (on the flange when there is no tool) |
+| `finger_left`, `finger_right` | The fingers of a parallel gripper (only when the tool has `fingers`), on the +y and the -y side of the tool |
 
 A tool is described by a YAML file, so changing the tool needs no code or URDF changes.
 Mesh paths are relative to the YAML file; STL, OBJ, DAE and GLB meshes are supported.
@@ -123,14 +124,35 @@ mount:                         # tool origin relative to the flange
   xyz: [0.0, 0.0, 0.0]         # metres
   rpy: [0.0, 0.0, 0.0]         # radians (or rpy_deg: [...] in degrees)
 tcp:                           # TCP relative to the tool origin
-  xyz: [0.0, 0.0, 0.120]
+  xyz: [0.0, 0.0, 0.134]
   rpy: [0.0, 0.0, 0.0]
-mass: 0.8                      # kg, used by Gazebo
+mass: 0.9                      # kg, used by Gazebo
 touch_links: [wrist3_link]     # robot links the tool may touch without a collision
+fingers:                       # optional: a parallel gripper whose two fingers close along y
+  mesh:                        # the finger on the +y side, in its own frame (see below)
+    visual: finger.stl
+    collision: finger.stl      # optional, defaults to visual
+    units: mm
+  origin: {xyz: [0.0, 0.0, 0.062]}   # finger frame on the tool origin when the gripper is closed
+  stroke: 0.055                # m each finger travels from closed to open
+  speed: 0.05                  # m/s of each finger
+  mass: 0.08                   # kg per finger, used by Gazebo
 ```
 ```
 ros2 launch fairino_sim fairino_gz_moveit2.launch.py tool:=/path/to/my_gripper.yaml
 ```
+The finger mesh is the finger on the +y side: its gripping face lies in the plane y = 0 of its
+own frame and it extends to +y, away from the other finger; the other finger is the same mesh
+turned 180 degrees about z. Each finger is a prismatic joint (`finger_left_joint`,
+`finger_right_joint`) whose value is the distance of its gripping face from the middle, from 0
+(closed) to `stroke` (open, the start position). In Gazebo the `gripper_controller` (a joint
+trajectory controller, `/gripper_controller/follow_joint_trajectory`) moves both; MoveIt and the
+recipe checks see the fingers where they are. With fingers, Gazebo's joints follow their
+commands more closely (gz_ros2_control `position_proportional_gain` 0.5 instead of 0.1), so the
+fingers reach the part when the recipe expects them to. The example gripper
+([`tools/example_gripper`](fairino_sim/tools/example_gripper)) opens to 110 mm; its meshes are
+made by `generate_meshes.py`. A tool without `fingers` (a vacuum cup, a fixed gripper) grips
+without moving parts.
 
 # Work cell
 `fairino_workcell` builds a work cell around the robot from one cell file. Equipment imported from
@@ -143,7 +165,9 @@ reachability, joint limits and collisions before it runs (see [Recipes](#recipes
 ros2 launch fairino_workcell fairino_workcell.launch.py
 ```
 A fairino5_v6 with the example gripper on a pedestal, next to a belt conveyor that brings four
-parts to its station, a table and a safety fence.
+parts to its station, a table and a safety fence. The parts do not lie exactly on the station:
+each one lies up to 3 cm across the belt and is turned up to 25 degrees (`placement_error`), and
+the recipes pick them where they are.
 
 | Argument | Default | Description |
 |---|---|---|
@@ -189,6 +213,11 @@ objects:
       speed: 0.15                               # m/s
       spacing: 0.30                             # m between parts on the belt
       count: 4                                  # parts to bring; 0 or omitted: no limit
+      placement_error:                          # optional: parts lie off their nominal place
+        across: 0.03                            # +/- m across the belt
+        along: 0.0                              # +/- m along the belt
+        yaw_deg: 25                             # +/- degrees about the vertical
+        seed: 7                                 # the same parts in every run
   - name: pedestal
     box: [0.30, 0.30, 0.75]                     # or cylinder: {radius: r, length: l}, in metres,
     pose: {xyz: [0.0, 0.0, 0.375]}              # centred on the pose
@@ -231,6 +260,16 @@ travel. The parts travel in a straight line. The conveyors start with the simula
         spacing: 0.90
   ```
 
+**Placement errors.** With `placement_error`, each part lies a random distance across the belt
+(`across`) and along it (`along`) from its nominal place, and is turned about the vertical
+(`yaw_deg`), each drawn evenly within +/- the given range. The draws depend only on `seed` and
+the part number, so a check, the run after it and every run after `--reset` see the same parts in
+the same places; another seed gives other places. An index conveyor still stops each part at the
+station along the belt (its sensor stops the belt), so `along` only makes parts arrive earlier or
+later there; on a continuous conveyor they pass the sensor earlier or later. A recipe finds the
+part where it lies through the frame `<conveyor>/part` (see [Recipes](#recipes)), as a vision
+system would report it; a conveyor object cannot have its own frame named `part`.
+
 ## Importing CAD files
 `import_cad` converts STEP, STL and OBJ files into a visual mesh (GLB) and a simplified collision
 mesh (STL), both in metres. STEP files carry their units; give `--units` for STL and OBJ files.
@@ -271,9 +310,11 @@ def recipe(cell):
     cell.move_joints(HOME, name='home')
     cell.move_to('conveyor/station', xyz=(0, 0, 0.18), rpy_deg=(180, 0, 180), name='above station')
     cell.wait_io('conveyor/part_ready', name='wait for part')
-    cell.move_to('conveyor/station', xyz=(0, 0, 0.03), rpy_deg=(180, 0, 180), speed=0.1,
-                 allow_contact=['part'], name='pick')
-    cell.grip(name='grip')
+    # conveyor/part: the part waiting at the station, wherever it lies; the gripper turns with it
+    cell.move_line('conveyor/part/grasp', xyz=(0, 0, 0.15), rpy_deg=(180, 0, 180), name='above part')
+    cell.move_line('conveyor/part/grasp', rpy_deg=(180, 0, 180), speed=0.1, name='pick')
+    cell.grip(name='grip')                                   # the fingers close on the part
+    cell.move_line('tcp', xyz=(0, 0, -0.15), name='lift')   # 15 cm back along the tool axis
     ...
 ```
 The examples in [`examples/conveyor_cell`](fairino_workcell/examples/conveyor_cell):
@@ -311,24 +352,24 @@ Every run prints a report, a line for each step as it finishes:
   1  home               move     OK         2.71s      94 mm  upperarm_link / pedestal  path is free
   2  1: above station   move     OK         1.65s      94 mm  upperarm_link / pedestal  path is free
   3  1: wait for part   wait     OK         0.64s      94 mm  upperarm_link / pedestal  conveyor/part_ready = true after 0.64 s
-  4  1: pick            move     OK         2.00s      25 mm  tool_link / conveyor      line is free
-  5  1: grip            grip     OK         0.00s          -                            gripped part_1, TCP 0.0 mm from part_1/grasp, lifting it from conveyor
-  6  1: lift            move     OK         1.00s      25 mm  tool_link / conveyor      line is free
-  7  1: above table     move     OK         3.20s      86 mm  part_1 / conveyor         path is free
+  4  1: above part      move     OK         0.76s      94 mm  upperarm_link / pedestal  line is free
+  5  1: pick            move     OK         2.00s      12 mm  finger_right / conveyor   line is free
+  6  1: grip            grip     OK         0.30s      12 mm  finger_right / conveyor   gripped part_1, TCP 0.0 mm from part_1/grasp, fingers closed to 80.0 mm in 0.30 s, lifting it from conveyor
+  7  1: lift            move     OK         1.00s      12 mm  finger_left / conveyor    line is free
 ...
-Cycle time 54.22 s | 38 steps: 38 OK, 0 warnings, 0 failed | waiting 0.64 s | 4 parts gripped, one every 12.46 s
+Cycle time 59.28 s | 42 steps: 42 OK, 0 warnings, 0 failed | waiting 0.64 s | 4 parts gripped, one every 13.69 s
 ```
 
 | Step | Description |
 |---|---|
 | `move_joints(joints, degrees=True, speed=None, name=None, allow_contact=())` | PTP move to joint angles j1..j6 |
-| `move_to(frame, xyz=(0, 0, 0), rpy_deg=(180, 0, 0), ...)` | PTP move of the TCP to a pose in `world`, an object, a part or `object/frame`; the default orientation points the tool down onto the frame |
+| `move_to(frame, xyz=(0, 0, 0), rpy_deg=None, ...)` | PTP move of the TCP to a pose in a frame (see below); by default the tool points down onto the frame |
 | `move_pose(pose, ...)` | PTP move of the TCP to a `geometry_msgs/PoseStamped` |
-| `move_line(frame, xyz=(0, 0, 0), rpy_deg=(180, 0, 0), ...)` | Straight TCP line to a pose (like MoveL) |
-| `move_arc(frame, via, xyz, rpy_deg=(180, 0, 0), ...)` | TCP arc through the point `via` to `xyz`, both in `frame` (like MoveC) |
-| `pick_moving(conveyor, approach=0.1, lift=0.1, rpy_deg=(180, 0, 0), speed=None, grip_time=0.3, part='')` | Pick a part on the move from a continuous conveyor (see below) |
-| `grip(name=None)` | Grip the movable object or part whose `grasp` frame is at the TCP (within 10 mm) |
-| `release(name=None)` | Leave the held object where it is |
+| `move_line(frame, xyz=(0, 0, 0), rpy_deg=None, ...)` | Straight TCP line to a pose (like MoveL) |
+| `move_arc(frame, via, xyz, rpy_deg=None, ...)` | TCP arc through the point `via` to `xyz`, both in `frame` (like MoveC) |
+| `pick_moving(conveyor, approach=0.1, lift=0.1, rpy_deg=(180, 0, 0), speed=None, grip_time=None, part='')` | Pick a part on the move from a continuous conveyor (see below) |
+| `grip(name=None)` | Close the gripper on the part at the TCP (see below) |
+| `release(name=None)` | Leave the held object where it is and open the fingers |
 | `wait_io(io, value=True, timeout=None, name=None)` | Wait until a virtual IO has the value; a timeout (s) fails the step |
 | `wait(seconds, name=None)` | Wait for a time |
 | `set_io(io, value, name=None)` | Set a virtual IO, for example an output to another machine |
@@ -340,13 +381,33 @@ Along a line or an arc the TCP orientation turns uniformly from the start to the
 `allow_contact` takes object names, part names (`part_3`) or part types (`part`: all its parts).
 A failed step raises `RecipeError` and stops the recipe.
 
+Frames of a target: `world`; an object or a part (`table`, `part_3`) and its named frames
+(`table/place`, `part_3/grasp`); `<conveyor>/part`, the part that conveyor has ready (at its
+station, or the first one past its sensor) wherever it lies, with its frames
+(`conveyor/part/grasp`); and `tcp`, the TCP where the move starts, for moves in the tool frame
+(its z axis points out of the tool, so `move_line('tcp', xyz=(0, 0, -0.1))` backs the tool off
+10 cm). By default the tool points down onto the frame (180 degrees about x), or keeps its
+orientation on `tcp`.
+
+**Gripping.** With a gripper that has fingers, `grip` closes them from where they are until they
+touch the part between them: the part whose `grasp` frame is nearest to the TCP. The finger that
+touches first pushes the part until the other one touches it too, so the part ends up centred
+between the fingers (the report says how far it was pushed; more than 10 mm is a warning). If
+the fingers close without touching it on both sides, the grip fails (`nothing to grip: the
+fingers close without touching part_1: it is not between them`). The closing takes the time the
+fingers need (0.30 s for the example gripper on the example part) and is checked against the
+cell; `release` opens them fully, also checked. A part on a running conveyor is picked with
+`pick_moving`. Without fingers, `grip` takes the object whose `grasp` frame is within 10 mm of the
+TCP, at once.
+
 ### Picking on the move
 `pick_moving` is one checked motion: the TCP comes in step with the part `approach` metres above
-its grasp pose (arriving at the belt's speed), goes down to it in a straight line while following
-it, follows it for `grip_time` while the gripper closes, lifts it `lift` metres while still
-following the belt, and stops. Without `part`, it takes the first part past the sensor that can
-still be caught, as a tracking system skips parts that are already too far; those leave the cell
-as missed parts.
+its grasp pose (arriving at the belt's speed, turned with the part: `rpy_deg` is relative to
+the part's grasp frame), goes down to it in a straight line while following it, follows it while
+the fingers close (`grip_time`, by default the time they need), lifts it `lift` metres while
+still following the belt, and stops. Without `part`, it takes the first part past the sensor that
+can still be caught, as a tracking system skips parts that are already too far; those leave the
+cell as missed parts.
 ```python
 cell.move_to('conveyor/sensor', xyz=(0.3, 0, 0.2), rpy_deg=(180, 0, 180), name='wait above belt')
 cell.wait_io('conveyor/part_ready', name='wait for part')
@@ -372,13 +433,18 @@ cell.pick_moving('conveyor', approach=0.10, lift=0.12, rpy_deg=(180, 0, 180), na
   that arrives at the station while the gripper is already down there.
 - **Clearance**: the smallest distance to the cell and the parts along the path, and the closest
   pair. Below 10 mm the step is a warning.
+- **Fingers**: the open fingers must come down beside the part without touching it, also on
+  the move; closing and opening them is checked against the rest of the cell, with the gripped
+  part allowed to touch them. A recipe that picks at a fixed place while the parts lie elsewhere
+  fails here (`collision at 68% of the path: finger_right <-> part_1`).
 - **Contacts**: a step can allow contact of the tool and the held object with named objects
-  (`allow_contact=['part']` while closing the fingers around the part). After `grip`, the next move
+  (`allow_contact=['table']` while setting a part down on it). After `grip`, the next move
   may lift the part off its support; after `release`, the next move may take the tool away from it.
 - **Contact** closer than 0.1 mm counts as a collision unless it is allowed, so setting a part
   down exactly on a surface needs `allow_contact`.
-- **Times**: the duration of every move (trapezoidal joint velocity profiles) and every wait, the
-  cycle time, the time spent waiting, how often a part is gripped and the parts missed.
+- **Times**: the duration of every move (trapezoidal joint velocity profiles), every wait and
+  every grip and release (the fingers' travel at their speed), the cycle time, the time spent
+  waiting, how often a part is gripped and the parts missed.
 
 ## Cell time
 In a check, the conveyors run in virtual time: a move lets them run for its duration, a wait
@@ -402,7 +468,7 @@ The recipe API only uses these ROS interfaces (`fairino_workcell_msgs`), so othe
 |---|---|---|
 | `/workcell/move` | action `Move` | PTP, LIN or CIRC to a joint or pose target, speed, allowed contacts, `check_only` |
 | `/workcell/pick_moving` | action `PickMoving` | Pick a part on the move from a continuous conveyor |
-| `/workcell/gripper` | service `Gripper` | Grip (`close: true`) or release |
+| `/workcell/gripper` | service `Gripper` | Grip (`close: true`) or release; fingers move in the simulation |
 | `/workcell/wait` | service `Wait` | Wait for a time or for an IO value |
 | `/workcell/set_io` | service `SetIO` | Set a virtual IO (conveyor sensors cannot be set) |
 | `/workcell/check/begin` | service `std_srvs/Trigger` | Start a check session from the current state |
