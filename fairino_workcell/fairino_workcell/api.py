@@ -253,7 +253,7 @@ class Workcell:
         if s['grip_interval'] is not None:
             text += f" | {s['grips']} parts gripped, one every {s['grip_interval']:.2f} s"
         if s['missed']:
-            text += f" | {s['missed']} parts missed"
+            text += f" | {s['missed']} part{'s' if s['missed'] > 1 else ''} missed"
         return text
 
     def print_report(self, stream=sys.stdout):

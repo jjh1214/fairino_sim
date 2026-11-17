@@ -246,12 +246,8 @@ class WorkcellExecutor(Node):
                 new, gone = [], []
                 step = min(dt, self.budget)
                 if self.ready and step > 0.0:
-                    before = set(self.run_state.poses)
-                    new = self.core.advance(self.run_state, step)
-                    gone = [name for name in before if name not in self.run_state.poses
-                            and name not in self.run_state.held]
+                    new, gone = self._advance_run(step)
                     self.budget -= step
-                    self.changed.notify_all()
                 state = self.run_state
                 try:
                     joints = self.current_joints()
@@ -297,6 +293,32 @@ class WorkcellExecutor(Node):
                 self.scene_poses[name] = poses[name]
             self.scene_pub.publish(scene)
             self.scene_sent = time.monotonic()
+
+    def _advance_run(self, dt):
+        """Run the conveyors of the run state for dt (lock held); return parts put in, gone."""
+        before = set(self.run_state.poses)
+        new = self.core.advance(self.run_state, dt)
+        gone = [name for name in before
+                if name not in self.run_state.poses and name not in self.run_state.held]
+        self.changed.notify_all()
+        return new, gone
+
+    def _flush_budget(self):
+        """
+        Let the rest of the step's planned time pass when the robot has finished.
+
+        The clock grants a step its time in ticks; without this, the part of the last tick
+        the step did not use would be lost and the conveyors would fall behind the plan.
+        """
+        new, gone = [], []
+        with self.changed:
+            if self.ready and 0.0 < self.budget < math.inf:
+                new, gone = self._advance_run(self.budget)
+                self.budget = 0.0
+        if new:
+            self._show_parts(new)
+        if gone:
+            self._hide_parts(gone)
 
     def _show_parts(self, names):
         """Put new parts into Gazebo, the MoveIt scene and RViz."""
@@ -467,6 +489,8 @@ class WorkcellExecutor(Node):
         self._grant(plan.profile.duration)      # the conveyors run while the robot moves
         goal_handle.publish_feedback(Move.Feedback(phase='execute'))
         self._execute(plan, goal_handle)
+        if self.in_run:
+            self._flush_budget()
         end = self.current_joints()
         error = float(np.max(np.abs(np.asarray(end) - np.asarray(plan.goal))))
         if error > self.execution_tolerance:
@@ -574,6 +598,8 @@ class WorkcellExecutor(Node):
         self._grant(plan.path.duration - plan.grip_at)
         if sent is not None:
             self._wait_trajectory(*sent, goal_handle)
+        if self.in_run:
+            self._flush_budget()
         end = self.current_joints()
         error = float(np.max(np.abs(np.asarray(end) - np.asarray(plan.goal))))
         if error > self.execution_tolerance:
