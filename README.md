@@ -207,12 +207,29 @@ when a recipe grips them; the other objects stay where the cell file puts them.
 In Gazebo the objects are visual only: the executor checks collisions itself, so Gazebo physics
 never stops the robot at a contact that a step allows (fingers around a part, a part set down).
 
-### Index conveyors
+### Conveyors
 A conveyor puts a part on its belt at the `entry` frame, then one every `spacing` metres of belt
-travel. The parts travel in a straight line to the `station` frame and stop there; the belt
-stands still while a part waits at the station, and the IO `<conveyor>/part_ready` (for example
-`conveyor/part_ready`) is true. When the robot grips that part, the belt runs again and brings
-the next one. The conveyors start with the simulation; `--reset` (see below) puts the parts back.
+travel. The parts travel in a straight line. The conveyors start with the simulation; `--reset`
+(see below) puts the parts back.
+
+- **Index conveyor** (`mode: index`, the default): the parts stop at the `station` frame. The belt
+  stands still while a part waits at the station, and the IO `<conveyor>/part_ready` (for example
+  `conveyor/part_ready`) is true. When the robot grips that part, the belt runs again and brings
+  the next one; the parts behind keep their spacing.
+- **Continuous conveyor** (`mode: continuous`): the belt keeps running. The `station` frame is a
+  sensor: `<conveyor>/part_ready` is true while a part that has passed it is on the belt, to be
+  picked on the move with `pick_moving` (conveyor tracking). Parts that reach the `exit` frame
+  leave the cell; the reports list them as missed.
+  ```yaml
+      conveyor:
+        mode: continuous
+        part: part
+        entry: entry
+        station: sensor        # a frame of the object: the sensor (photo-eye)
+        exit: exit             # parts that reach it leave the belt
+        speed: 0.06
+        spacing: 0.90
+  ```
 
 ## Importing CAD files
 `import_cad` converts STEP, STL and OBJ files into a visual mesh (GLB) and a simplified collision
@@ -229,7 +246,20 @@ Then, from the directory of the cell file, with the workspace sourced:
 ```
 It prints the entries to paste into the cell file. Options: `--origin keep|center|bottom`
 (default: keep the CAD origin), `--collision mesh|convex|box` and `--max-faces N`
-(triangle budget of the collision mesh, default 3000).
+(triangle budget of the collision mesh, default 3000). With `--part` it prints part type
+entries for the `parts` list (no pose, a `grasp` frame to set) instead of objects.
+
+## Tests
+```
+cd ~/fairino_ws
+colcon test --packages-select fairino_sim fairino_workcell && colcon test-result --verbose
+```
+The `import_cad` tests need the packages of `requirements-cad.txt` and are skipped without
+them; run them with the virtual environment of [Importing CAD files](#importing-cad-files):
+```
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 ~/fairino_cad_venv/bin/python -m pytest \
+  ~/fairino_ws/src/fairino_sim/fairino_workcell/test/test_cad_import.py
+```
 
 # Recipes
 A recipe is a Python function that receives the cell. Steps take joint angles (degrees, as on the
@@ -250,7 +280,12 @@ The examples in [`examples/conveyor_cell`](fairino_workcell/examples/conveyor_ce
 - [`pick_and_place.py`](fairino_workcell/examples/conveyor_cell/pick_and_place.py): wait for the
   first part at the conveyor station and place it on the table;
 - [`index_cycle.py`](fairino_workcell/examples/conveyor_cell/index_cycle.py): take the four parts
-  the conveyor brings, one after the other, and place them on the table in a 2 x 2 pattern.
+  the conveyor brings, one after the other, and place them on the table in a 2 x 2 pattern;
+- [`lines_and_arcs.py`](fairino_workcell/examples/conveyor_cell/lines_and_arcs.py): trace a
+  rectangle with rounded corners above the table with straight lines and arcs (MoveL, MoveC);
+- [`pick_on_the_move.py`](fairino_workcell/examples/conveyor_cell/pick_on_the_move.py) with
+  [`tracking_cell.yaml`](fairino_workcell/examples/conveyor_cell/tracking_cell.yaml): the belt
+  keeps running and the robot picks the parts on the move.
 
 Start the cell:
 ```
@@ -276,12 +311,12 @@ Every run prints a report, a line for each step as it finishes:
   1  home               move     OK         2.71s      94 mm  upperarm_link / pedestal  path is free
   2  1: above station   move     OK         1.65s      94 mm  upperarm_link / pedestal  path is free
   3  1: wait for part   wait     OK         0.64s      94 mm  upperarm_link / pedestal  conveyor/part_ready = true after 0.64 s
-  4  1: pick            move     OK         2.20s      25 mm  tool_link / conveyor      path is free
+  4  1: pick            move     OK         2.00s      25 mm  tool_link / conveyor      line is free
   5  1: grip            grip     OK         0.00s          -                            gripped part_1, TCP 0.0 mm from part_1/grasp, lifting it from conveyor
-  6  1: lift            move     OK         1.27s      25 mm  tool_link / conveyor      path is free
-  7  1: above table     move     OK         3.20s      85 mm  part_1 / part_2           path is free
+  6  1: lift            move     OK         1.00s      25 mm  tool_link / conveyor      line is free
+  7  1: above table     move     OK         3.20s      86 mm  part_1 / conveyor         path is free
 ...
-Cycle time 57.69 s | 38 steps: 38 OK, 0 warnings, 0 failed | waiting 0.64 s | 4 parts gripped, one every 13.39 s
+Cycle time 54.22 s | 38 steps: 38 OK, 0 warnings, 0 failed | waiting 0.64 s | 4 parts gripped, one every 12.46 s
 ```
 
 | Step | Description |
@@ -289,20 +324,46 @@ Cycle time 57.69 s | 38 steps: 38 OK, 0 warnings, 0 failed | waiting 0.64 s | 4 
 | `move_joints(joints, degrees=True, speed=None, name=None, allow_contact=())` | PTP move to joint angles j1..j6 |
 | `move_to(frame, xyz=(0, 0, 0), rpy_deg=(180, 0, 0), ...)` | PTP move of the TCP to a pose in `world`, an object, a part or `object/frame`; the default orientation points the tool down onto the frame |
 | `move_pose(pose, ...)` | PTP move of the TCP to a `geometry_msgs/PoseStamped` |
+| `move_line(frame, xyz=(0, 0, 0), rpy_deg=(180, 0, 0), ...)` | Straight TCP line to a pose (like MoveL) |
+| `move_arc(frame, via, xyz, rpy_deg=(180, 0, 0), ...)` | TCP arc through the point `via` to `xyz`, both in `frame` (like MoveC) |
+| `pick_moving(conveyor, approach=0.1, lift=0.1, rpy_deg=(180, 0, 0), speed=None, grip_time=0.3, part='')` | Pick a part on the move from a continuous conveyor (see below) |
 | `grip(name=None)` | Grip the movable object or part whose `grasp` frame is at the TCP (within 10 mm) |
 | `release(name=None)` | Leave the held object where it is |
 | `wait_io(io, value=True, timeout=None, name=None)` | Wait until a virtual IO has the value; a timeout (s) fails the step |
 | `wait(seconds, name=None)` | Wait for a time |
 | `set_io(io, value, name=None)` | Set a virtual IO, for example an output to another machine |
 
-`speed` is a fraction of the joint velocity and acceleration limits (default 0.3).
+`speed` is a fraction (default 0.3) of the joint velocity and acceleration limits for PTP moves,
+and of the TCP limits for lines, arcs and picks on the move: 1.0 m/s and 2.0 m/s² by default
+(executor parameters `max_tcp_speed`, `max_tcp_acceleration`; the FAIRINO values may differ).
+Along a line or an arc the TCP orientation turns uniformly from the start to the target.
 `allow_contact` takes object names, part names (`part_3`) or part types (`part`: all its parts).
 A failed step raises `RecipeError` and stops the recipe.
+
+### Picking on the move
+`pick_moving` is one checked motion: the TCP comes in step with the part `approach` metres above
+its grasp pose (arriving at the belt's speed), goes down to it in a straight line while following
+it, follows it for `grip_time` while the gripper closes, lifts it `lift` metres while still
+following the belt, and stops. Without `part`, it takes the first part past the sensor that can
+still be caught, as a tracking system skips parts that are already too far; those leave the cell
+as missed parts.
+```python
+cell.move_to('conveyor/sensor', xyz=(0.3, 0, 0.2), rpy_deg=(180, 0, 180), name='wait above belt')
+cell.wait_io('conveyor/part_ready', name='wait for part')
+cell.pick_moving('conveyor', approach=0.10, lift=0.12, rpy_deg=(180, 0, 180), name='pick')
+```
 
 ## What is checked
 - **Reachability and joint limits.** A pose target is solved like on the robot controller: the
   joint solution nearest to the current joints, so the arm configuration (shoulder, elbow, wrist)
   follows from the previous step and a check gives the same joints as the run.
+- **Lines, arcs and picks on the move** are followed point by point from the current joints. They
+  fail where the TCP leaves the reach, where a joint leaves its limits, or where the arm would
+  have to change its configuration (a singularity); the message names the singularity, for
+  example `j6 leaves its limits at 85% of the path (175.3 deg), after passing close to the wrist
+  singularity at 50% (j5 3.4 deg)`. Coming within 5 degrees (wrist j5, elbow j3) or 2 cm
+  (shoulder) of a singularity is a warning. Where a joint would turn faster than its limit, a line
+  or arc slows down (a warning); a pick on the move cannot, so it fails.
 - **Collisions along the whole path** of the robot, the tool and the held object, with the cell
   objects, the parts and themselves (every 0.5 degrees of joint motion). Parts on a running
   conveyor are checked where they are at each moment of the move. The report names the colliding
@@ -314,8 +375,10 @@ A failed step raises `RecipeError` and stops the recipe.
 - **Contacts**: a step can allow contact of the tool and the held object with named objects
   (`allow_contact=['part']` while closing the fingers around the part). After `grip`, the next move
   may lift the part off its support; after `release`, the next move may take the tool away from it.
+- **Contact** closer than 0.1 mm counts as a collision unless it is allowed, so setting a part
+  down exactly on a surface needs `allow_contact`.
 - **Times**: the duration of every move (trapezoidal joint velocity profiles) and every wait, the
-  cycle time, the time spent waiting and how often a part is gripped.
+  cycle time, the time spent waiting, how often a part is gripped and the parts missed.
 
 ## Cell time
 In a check, the conveyors run in virtual time: a move lets them run for its duration, a wait
@@ -337,7 +400,8 @@ The recipe API only uses these ROS interfaces (`fairino_workcell_msgs`), so othe
 
 | Interface | Type | Description |
 |---|---|---|
-| `/workcell/move` | action `Move` | Joint or pose target, speed, allowed contacts, `check_only`; result and feedback |
+| `/workcell/move` | action `Move` | PTP, LIN or CIRC to a joint or pose target, speed, allowed contacts, `check_only` |
+| `/workcell/pick_moving` | action `PickMoving` | Pick a part on the move from a continuous conveyor |
 | `/workcell/gripper` | service `Gripper` | Grip (`close: true`) or release |
 | `/workcell/wait` | service `Wait` | Wait for a time or for an IO value |
 | `/workcell/set_io` | service `SetIO` | Set a virtual IO (conveyor sensors cannot be set) |
