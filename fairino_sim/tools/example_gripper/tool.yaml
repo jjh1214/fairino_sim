@@ -1,15 +1,24 @@
-# Example tool for fairino_sim: a simple two-finger gripper.
+# Example tool for fairino_sim: an electric parallel gripper with two fingers.
 # Use it with  tool:=example_gripper  (your own tools:  tool:=/path/to/tool.yaml)
+# The meshes are made by generate_meshes.py.
 name: example_gripper
 mesh:
-  visual: example_gripper.stl      # STL, OBJ, DAE or GLB, relative to this file
-  collision: example_gripper.stl   # optional, defaults to visual
+  visual: body.stl                 # STL, OBJ, DAE or GLB, relative to this file
+  collision: body.stl              # optional, defaults to visual
   units: mm                        # required: m or mm
 mount:                             # tool origin relative to the robot flange
   xyz: [0.0, 0.0, 0.0]             # metres
   rpy: [0.0, 0.0, 0.0]             # radians (or rpy_deg: [..] in degrees)
 tcp:                               # tool centre point relative to the tool origin
-  xyz: [0.0, 0.0, 0.120]
+  xyz: [0.0, 0.0, 0.134]           # between the fingers, 18 mm above their tips
   rpy: [0.0, 0.0, 0.0]
-mass: 0.8                          # kg, used by Gazebo
+mass: 0.9                          # kg, used by Gazebo
 touch_links: [wrist3_link]         # robot links the tool may touch without a collision
+fingers:                           # optional: two fingers that close along the tool y axis
+  mesh:                            # the finger on the +y side, in its own frame: the gripping
+    visual: finger.stl             # face lies in y = 0 and the finger extends to +y; the other
+    units: mm                      # finger is the same mesh turned 180 degrees about z
+  origin: {xyz: [0.0, 0.0, 0.062]} # finger frame on the tool origin when the gripper is closed
+  stroke: 0.055                    # m each finger travels from closed to open (opening 110 mm)
+  speed: 0.05                      # m/s of each finger
+  mass: 0.08                       # kg per finger, used by Gazebo

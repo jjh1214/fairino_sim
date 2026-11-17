@@ -13,8 +13,10 @@
 		</joint>
 	</xacro:macro>
 
-	<!-- initial_positions: angles of j1..j6 in radians, separated by spaces -->
-	<xacro:macro name="frcobot_gz_ros2_control" params="initial_positions">
+	<!-- initial_positions: angles of j1..j6 in radians, separated by spaces;
+	     fingers: the finger mesh of the tool (empty: no fingers);
+	     finger_open: start position of the finger joints (open) -->
+	<xacro:macro name="frcobot_gz_ros2_control" params="initial_positions fingers:='' finger_open:=0.0">
 		<xacro:property name="q0" value="${initial_positions.split()}"/>
 
 		<ros2_control name="GazeboSimSystem" type="system">
@@ -28,6 +30,10 @@
 			<xacro:frcobot_gz_joint name="j4" initial="${q0[3]}"/>
 			<xacro:frcobot_gz_joint name="j5" initial="${q0[4]}"/>
 			<xacro:frcobot_gz_joint name="j6" initial="${q0[5]}"/>
+			<xacro:if value="${fingers != ''}">
+				<xacro:frcobot_gz_joint name="finger_left_joint" initial="${finger_open}"/>
+				<xacro:frcobot_gz_joint name="finger_right_joint" initial="${finger_open}"/>
+			</xacro:if>
 		</ros2_control>
 
 	</xacro:macro>

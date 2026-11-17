@@ -4,10 +4,16 @@
     flange    : tool mounting face at the end of wrist3_link (always present)
     tool_link : optional tool body mounted on the flange
     tcp       : tool centre point, on tool_link if a tool is present, else on the flange
+    finger_left, finger_right : optional fingers of a parallel gripper on tool_link, on the
+                +y and the -y side; each prismatic joint is the distance of the finger's
+                gripping face from the tool's xz plane (0: closed)
 -->
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
   <xacro:macro name="frcobot_tool"
-               params="model visual collision scale mount_xyz mount_rpy mass tcp_xyz tcp_rpy">
+               params="model visual collision scale mount_xyz mount_rpy mass tcp_xyz tcp_rpy
+                       finger_visual:='' finger_collision:='' finger_scale:=1.0
+                       finger_xyz:='0 0 0' finger_stroke:=0.0 finger_speed:=0.05
+                       finger_mass:=0.05">
 
     <xacro:property name="flange_offsets"
                     value="${xacro.load_yaml('$(find fairino_sim)/config/flange_offsets.yaml')}"/>
@@ -50,6 +56,19 @@
       </joint>
     </xacro:if>
 
+    <xacro:if value="${has_tool and finger_visual != ''}">
+      <xacro:property name="fxyz" value="${[float(v) for v in finger_xyz.split()]}"/>
+      <xacro:frcobot_finger name="finger_left" xyz="${fxyz[0]} ${fxyz[1]} ${fxyz[2]}" yaw="0"
+                            visual="${finger_visual}" collision="${finger_collision}"
+                            scale="${finger_scale}" stroke="${finger_stroke}"
+                            speed="${finger_speed}" mass="${finger_mass}"/>
+      <xacro:frcobot_finger name="finger_right" xyz="${fxyz[0]} ${-fxyz[1]} ${fxyz[2]}"
+                            yaw="${pi}" visual="${finger_visual}"
+                            collision="${finger_collision}" scale="${finger_scale}"
+                            stroke="${finger_stroke}" speed="${finger_speed}"
+                            mass="${finger_mass}"/>
+    </xacro:if>
+
     <link name="tcp"/>
     <joint name="tcp_joint" type="fixed">
       <parent link="${'tool_link' if has_tool else 'flange'}"/>
@@ -57,5 +76,39 @@
       <origin xyz="${tcp_xyz}" rpy="${tcp_rpy}"/>
     </joint>
 
+  </xacro:macro>
+
+  <!-- One finger: its frame has the gripping face in y = 0; the joint moves it along +y -->
+  <xacro:macro name="frcobot_finger" params="name xyz yaw visual collision scale stroke speed mass">
+    <link name="${name}">
+      <visual>
+        <geometry>
+          <mesh filename="${visual}" scale="${scale} ${scale} ${scale}"/>
+        </geometry>
+        <material name="fairino_sim_finger">
+          <color rgba="0.22 0.24 0.27 1.0"/>
+        </material>
+      </visual>
+      <collision>
+        <geometry>
+          <mesh filename="${collision}" scale="${scale} ${scale} ${scale}"/>
+        </geometry>
+      </collision>
+      <inertial>
+        <mass value="${mass}"/>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <inertia ixx="${mass * 0.0004}" ixy="0" ixz="0"
+                 iyy="${mass * 0.0004}" iyz="0" izz="${mass * 0.0004}"/>
+      </inertial>
+    </link>
+    <joint name="${name}_joint" type="prismatic">
+      <parent link="tool_link"/>
+      <child link="${name}"/>
+      <origin xyz="${xyz}" rpy="0 0 ${yaw}"/>
+      <axis xyz="0 1 0"/>
+      <!-- 2 mm beyond the open position: a joint resting on its limit can stick in Gazebo -->
+      <limit lower="0.0" upper="${stroke + 0.002}" effort="200.0" velocity="${speed}"/>
+      <dynamics damping="1.0" friction="0.0"/>
+    </joint>
   </xacro:macro>
 </robot>

@@ -1,11 +1,15 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
-	<!-- controllers_file: ros2_control parameter file for the gz_ros2_control plugin -->
-	<xacro:macro name="frcobot_gz" params="controllers_file">
+	<!-- controllers_file: ros2_control parameter file for the gz_ros2_control plugin;
+	     gripper_controllers_file: parameters of the gripper controller, or empty -->
+	<xacro:macro name="frcobot_gz" params="controllers_file gripper_controllers_file:=''">
 
     <gazebo>
       <plugin filename="gz_ros2_control-system" name="gz_ros2_control::GazeboSimROS2ControlPlugin">
           <parameters>${controllers_file}</parameters>
+          <xacro:if value="${gripper_controllers_file != ''}">
+            <parameters>${gripper_controllers_file}</parameters>
+          </xacro:if>
         </plugin>
     </gazebo>
 

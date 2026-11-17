@@ -76,6 +76,14 @@ def launch_setup(context):
         arguments=[description.trajectory_controller_name(robot_name),
                    '--param-file', controllers_file],
         parameters=[use_sim_time])
+    spawners = [joint_state_broadcaster_spawner, arm_controller_spawner]
+    if robot['tool'] is not None and robot['tool'].fingers is not None:
+        spawners.append(Node(
+            package='controller_manager',
+            executable='spawner',
+            arguments=[description.GRIPPER_CONTROLLER,
+                       '--param-file', description.gripper_controllers_file()],
+            parameters=[use_sim_time]))
 
     moveit_nodes = [Node(
         package='moveit_ros_move_group',
@@ -105,7 +113,7 @@ def launch_setup(context):
         gz_spawn_entity,
         RegisterEventHandler(OnProcessExit(
             target_action=gz_spawn_entity,
-            on_exit=[joint_state_broadcaster_spawner, arm_controller_spawner])),
+            on_exit=spawners)),
         RegisterEventHandler(OnProcessExit(
             target_action=arm_controller_spawner, on_exit=moveit_nodes)),
     ]

@@ -26,12 +26,37 @@ SUPPORTED_MODELS = (
 DEFAULT_INITIAL_POSITIONS = (0.0, -1.571, 0.0, 0.0, 0.0, 0.0)
 MESH_UNITS = {'m': 1.0, 'mm': 0.001}
 MESH_EXTENSIONS = ('.stl', '.obj', '.dae', '.glb', '.gltf')
-TOOL_KEYS = {'name', 'mesh', 'mount', 'tcp', 'mass', 'touch_links'}
-ADDED_LINKS = ('world', 'flange', 'tool_link', 'tcp')
+TOOL_KEYS = {'name', 'mesh', 'mount', 'tcp', 'mass', 'touch_links', 'fingers'}
+FINGER_KEYS = {'mesh', 'origin', 'stroke', 'speed', 'mass'}
+FINGER_LINKS = ('finger_left', 'finger_right')        # on the +y and the -y side of the tool
+FINGER_JOINTS = ('finger_left_joint', 'finger_right_joint')
+GRIPPER_CONTROLLER = 'gripper_controller'
+ADDED_LINKS = ('world', 'flange', 'tool_link', 'tcp') + FINGER_LINKS
 
 
 class DescriptionError(RuntimeError):
     """The robot description cannot be built from the given inputs."""
+
+
+@dataclass(frozen=True)
+class Fingers:
+    """
+    The two fingers of a parallel gripper, which close along the y axis of the tool.
+
+    The finger mesh is the finger on the +y side in its own frame: its gripping face lies in the
+    plane y = 0 and it extends to +y. The finger frame sits at origin_xyz on the tool when the
+    gripper is closed; each finger joint is the distance of its gripping face from the tool's xz
+    plane, from 0 (closed) to stroke (open). The other finger is the same mesh turned 180
+    degrees about z.
+    """
+
+    visual: str
+    collision: str
+    scale: float
+    origin_xyz: tuple
+    stroke: float        # m each finger travels
+    speed: float         # m/s of each finger
+    mass: float
 
 
 @dataclass(frozen=True)
@@ -48,6 +73,7 @@ class Tool:
     tcp_rpy: tuple
     mass: float
     touch_links: tuple
+    fingers: Fingers = None
 
 
 def share_dir(package):
@@ -142,6 +168,52 @@ def _mesh_path(base_dir, relative, tool_file):
     return path
 
 
+def _positive(data, key, default, what):
+    try:
+        value = float(data.get(key, default))
+    except (TypeError, ValueError):
+        value = -1.0
+    if value <= 0.0:
+        raise DescriptionError(f'{what}: {key} must be a positive number')
+    return value
+
+
+def _meshes(mesh, base_dir, path, what):
+    """Return (visual, collision, scale) of a mesh mapping of a tool file."""
+    if not isinstance(mesh, dict) or 'visual' not in mesh:
+        raise DescriptionError(f'Tool file {path}: {what}.visual is required')
+    units = mesh.get('units')
+    if units not in MESH_UNITS:
+        raise DescriptionError(
+            f"Tool file {path}: {what}.units is required and must be 'm' or 'mm' "
+            '(STL and OBJ files carry no units)')
+    visual = _mesh_path(base_dir, mesh['visual'], path)
+    collision = _mesh_path(base_dir, mesh.get('collision', mesh['visual']), path)
+    return visual, collision, MESH_UNITS[units]
+
+
+def _load_fingers(data, base_dir, path):
+    where = f'Tool file {path}: fingers'
+    if not isinstance(data, dict):
+        raise DescriptionError(f'{where} must be a mapping')
+    unknown = set(data) - FINGER_KEYS
+    if unknown:
+        raise DescriptionError(f'{where}: unknown keys {sorted(unknown)}')
+    for key in ('mesh', 'stroke', 'speed'):
+        if key not in data:
+            raise DescriptionError(f'{where}: {key} is required')
+    visual, collision, scale = _meshes(data['mesh'], base_dir, path, 'fingers.mesh')
+    origin = data.get('origin') or {}
+    if not isinstance(origin, dict) or set(origin) - {'xyz'}:
+        raise DescriptionError(f'{where}: origin must be {{xyz: [x, y, z]}} in metres')
+    return Fingers(visual=visual, collision=collision, scale=scale,
+                   origin_xyz=parse_vector(origin.get('xyz', (0, 0, 0)), 3,
+                                           'fingers.origin.xyz'),
+                   stroke=_positive(data, 'stroke', None, where),
+                   speed=_positive(data, 'speed', None, where),
+                   mass=_positive(data, 'mass', 0.05, where))
+
+
 def load_tool(path):
     """Load and validate a tool YAML file. Mesh paths are relative to the YAML file."""
     try:
@@ -155,17 +227,8 @@ def load_tool(path):
     if unknown:
         raise DescriptionError(f'Tool file {path}: unknown keys {sorted(unknown)}')
 
-    mesh = data.get('mesh')
-    if not isinstance(mesh, dict) or 'visual' not in mesh:
-        raise DescriptionError(f'Tool file {path}: mesh.visual is required')
-    units = mesh.get('units')
-    if units not in MESH_UNITS:
-        raise DescriptionError(
-            f"Tool file {path}: mesh.units is required and must be 'm' or 'mm' "
-            '(STL and OBJ files carry no units)')
     base_dir = os.path.dirname(os.path.abspath(path))
-    visual = _mesh_path(base_dir, mesh['visual'], path)
-    collision = _mesh_path(base_dir, mesh.get('collision', mesh['visual']), path)
+    visual, collision, scale = _meshes(data.get('mesh'), base_dir, path, 'mesh')
 
     mount_xyz, mount_rpy = parse_pose(data.get('mount'), 'mount')
     tcp_xyz, tcp_rpy = parse_pose(data.get('tcp'), 'tcp')
@@ -179,23 +242,36 @@ def load_tool(path):
     if isinstance(touch_links, str) or not all(isinstance(v, str) for v in touch_links):
         raise DescriptionError(f'Tool file {path}: touch_links must be a list of link names')
 
+    fingers = _load_fingers(data['fingers'], base_dir, path) if 'fingers' in data else None
+
     return Tool(
         name=str(data.get('name', os.path.basename(base_dir))),
         visual=visual,
         collision=collision,
-        scale=MESH_UNITS[units],
+        scale=scale,
         mount_xyz=mount_xyz,
         mount_rpy=mount_rpy,
         tcp_xyz=tcp_xyz,
         tcp_rpy=tcp_rpy,
         mass=mass,
         touch_links=tuple(touch_links),
+        fingers=fingers,
     )
+
+
+def gripper_controllers_file():
+    """Return the ros2_control parameters of the gripper controller (tools with fingers)."""
+    return os.path.join(share_dir('fairino_sim'), 'config', 'gripper_controller.yaml')
 
 
 def build_urdf(robot_name, controllers_file, base_xyz='0 0 0', base_rpy='0 0 0',
                initial_positions=DEFAULT_INITIAL_POSITIONS, tool=None, damping=None):
-    """Return the URDF text used by Gazebo, robot_state_publisher, MoveIt and RViz."""
+    """
+    Return the URDF text used by Gazebo, robot_state_publisher, MoveIt and RViz.
+
+    A tool with fingers adds the finger joints, open at the start, and the parameters of the
+    gripper controller for Gazebo.
+    """
     mappings = {
         'robot_name': robot_name,
         'controllers_file': controllers_file,
@@ -213,6 +289,18 @@ def build_urdf(robot_name, controllers_file, base_xyz='0 0 0', base_rpy='0 0 0',
             'tool_mass': repr(tool.mass),
             'tcp_xyz': _format(tool.tcp_xyz),
             'tcp_rpy': _format(tool.tcp_rpy),
+        })
+    if tool is not None and tool.fingers is not None:
+        fingers = tool.fingers
+        mappings.update({
+            'finger_visual': 'file://' + fingers.visual,
+            'finger_collision': 'file://' + fingers.collision,
+            'finger_scale': repr(fingers.scale),
+            'finger_xyz': _format(fingers.origin_xyz),
+            'finger_stroke': repr(fingers.stroke),
+            'finger_speed': repr(fingers.speed),
+            'finger_mass': repr(fingers.mass),
+            'gripper_controllers_file': gripper_controllers_file(),
         })
     xacro_file = os.path.join(share_dir('fairino_sim'), 'config', 'frcobot_gz.urdf.xacro')
     try:
@@ -254,4 +342,13 @@ def build_srdf(robot_name, tool=None):
             reason = 'Adjacent' if link == 'wrist3_link' else 'User'
             ET.SubElement(root, 'disable_collisions', link1='tool_link', link2=link,
                           reason=reason)
+        if tool.fingers is not None:
+            # the fingers slide on the tool and meet when the gripper closes empty
+            pairs = [(finger, 'tool_link', 'Adjacent') for finger in FINGER_LINKS]
+            pairs += [(finger, link, 'User') for finger in FINGER_LINKS
+                      for link in tool.touch_links]
+            pairs.append((FINGER_LINKS[0], FINGER_LINKS[1], 'User'))
+            for link1, link2, reason in pairs:
+                ET.SubElement(root, 'disable_collisions', link1=link1, link2=link2,
+                              reason=reason)
     return ET.tostring(root, encoding='unicode')

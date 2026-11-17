@@ -51,6 +51,14 @@ def launch_setup(context):
              parameters=[use_sim_time])
         for controller in ('joint_state_broadcaster', 'frcobot_position_controller')
     ]
+    if robot['tool'] is not None and robot['tool'].fingers is not None:
+        # move the fingers with a trajectory on /gripper_controller/joint_trajectory
+        spawners.append(Node(
+            package='controller_manager',
+            executable='spawner',
+            arguments=[description.GRIPPER_CONTROLLER,
+                       '--param-file', description.gripper_controllers_file()],
+            parameters=[use_sim_time]))
     return [
         robot_state_publisher,
         gz_spawn_entity,

@@ -58,7 +58,7 @@ def test_base_pose_initial_positions_and_tool():
     assert 'tool_link' in links(urdf)
     tcp = joints(urdf)['tcp_joint']
     assert tcp.find('parent').get('link') == 'tool_link'
-    assert [float(v) for v in tcp.find('origin').get('xyz').split()] == [0.0, 0.0, 0.12]
+    assert [float(v) for v in tcp.find('origin').get('xyz').split()] == [0.0, 0.0, 0.134]
     meshes = [m for m in ET.fromstring(urdf).iter('mesh')
               if 'example_gripper' in m.get('filename')]
     assert meshes and all(m.get('scale') == '0.001 0.001 0.001' for m in meshes)
@@ -72,6 +72,55 @@ def test_srdf_disables_tool_collisions_with_touch_links():
     assert ('tool_link', 'wrist3_link') not in [
         (e.get('link1'), e.get('link2'))
         for e in ET.fromstring(d.build_srdf('fairino5_v6')).findall('disable_collisions')]
+
+
+def test_fingers_are_prismatic_joints_driven_by_the_gripper_controller():
+    tool = d.load_tool(d.resolve_tool_file('example_gripper'))
+    assert tool.fingers.stroke == 0.055 and tool.fingers.speed == 0.05
+    urdf = d.build_urdf('fairino5_v6', controllers_file(), tool=tool)
+    root = ET.fromstring(urdf)
+    for name, yaw in (('finger_left_joint', '0'), ('finger_right_joint', repr(3.141592653589793))):
+        joint = joints(urdf)[name]
+        assert joint.get('type') == 'prismatic'
+        assert joint.find('parent').get('link') == 'tool_link'
+        assert joint.find('axis').get('xyz') == '0 1 0'
+        assert joint.find('origin').get('rpy').split()[2] == yaw     # the right one turned
+        limit = joint.find('limit')     # 2 mm beyond open: Gazebo sticks at a limit
+        assert float(limit.get('lower')) == 0.0 and float(limit.get('velocity')) == 0.05
+        assert float(limit.get('upper')) == pytest.approx(0.057)
+    assert {'finger_left', 'finger_right'} <= links(urdf)
+    # Gazebo: both fingers are position controlled and start open
+    control = {j.get('name'): j for j in root.iter('ros2_control')}['GazeboSimSystem']
+    starts = {j.get('name'): j.find('state_interface/param').text for j in control.iter('joint')}
+    assert starts['finger_left_joint'] == starts['finger_right_joint'] == '0.055'
+    parameters = [p.text for p in root.iter('parameters')]
+    assert parameters == [controllers_file(), d.gripper_controllers_file()]
+    srdf = ET.fromstring(d.build_srdf('fairino5_v6', tool))
+    rules = [(e.get('link1'), e.get('link2')) for e in srdf.findall('disable_collisions')]
+    assert ('finger_left', 'finger_right') in rules and ('finger_right', 'tool_link') in rules
+    # without fingers nothing changes
+    plain = d.build_urdf('fairino5_v6', controllers_file())
+    assert 'finger_left' not in links(plain)
+    assert [p.text for p in ET.fromstring(plain).iter('parameters')] == [controllers_file()]
+
+
+FINGERS = ('mesh: {visual: tool.stl, units: mm}\nfingers:\n'
+           '  mesh: {visual: tool.stl, units: mm}\n')
+
+
+@pytest.mark.parametrize('text, message', [
+    (FINGERS + '  speed: 0.05\n', 'stroke is required'),
+    (FINGERS + '  stroke: 0.05\n  speed: -1\n', 'speed must be a positive number'),
+    (FINGERS + '  stroke: 0.05\n  speed: 0.1\n  grip: 1\n', 'unknown keys'),
+    (FINGERS + '  stroke: 0.05\n  speed: 0.1\n  origin: {rpy: [0, 0, 1]}\n', 'origin must be'),
+    ('mesh: {visual: tool.stl, units: mm}\nfingers: {stroke: 0.05, speed: 0.1}\n',
+     'mesh is required'),
+    ('mesh: {visual: tool.stl, units: mm}\nfingers:\n  mesh: {visual: tool.stl}\n'
+     '  stroke: 0.05\n  speed: 0.1\n', 'fingers.mesh.units is required'),
+])
+def test_invalid_fingers_raise_clear_errors(tmp_path, text, message):
+    with pytest.raises(d.DescriptionError, match=message):
+        d.load_tool(write_tool(tmp_path, text))
 
 
 def test_tool_rpy_in_degrees(tmp_path):

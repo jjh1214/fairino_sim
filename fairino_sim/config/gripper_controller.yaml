@@ -1,0 +1,23 @@
+# ros2_control parameters for tools with fingers. The launch files add them to the controllers
+# of the arm; the two finger joints move together.
+controller_manager:
+  ros__parameters:
+    gripper_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+gripper_controller:
+  ros__parameters:
+    joints:
+      - finger_left_joint
+      - finger_right_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+
+# Gazebo moves a position-controlled joint at this gain times its position error (per control
+# cycle). The default (0.1) lets the fingers lag about 0.15 s behind their trajectory, so they
+# would touch a part only after the robot has started to lift it.
+gz_ros_control:
+  ros__parameters:
+    position_proportional_gain: 0.5

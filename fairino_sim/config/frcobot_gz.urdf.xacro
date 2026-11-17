@@ -24,6 +24,16 @@
   <xacro:arg name="tool_mass" default="0.5"/>
   <xacro:arg name="tcp_xyz" default="0 0 0"/>
   <xacro:arg name="tcp_rpy" default="0 0 0"/>
+  <!-- Optional fingers of a parallel gripper on the tool: empty finger_visual means none -->
+  <xacro:arg name="finger_visual" default=""/>
+  <xacro:arg name="finger_collision" default=""/>
+  <xacro:arg name="finger_scale" default="1.0"/>
+  <xacro:arg name="finger_xyz" default="0 0 0"/>
+  <xacro:arg name="finger_stroke" default="0.0"/>
+  <xacro:arg name="finger_speed" default="0.05"/>
+  <xacro:arg name="finger_mass" default="0.05"/>
+  <!-- ros2_control parameters of the gripper controller, for tools with fingers -->
+  <xacro:arg name="gripper_controllers_file" default=""/>
 
   <xacro:property name="model" value="$(arg robot_name)"/>
 
@@ -32,8 +42,11 @@
   <xacro:include filename="$(find fairino_sim)/config/frcobot_gz_ros2_control.xacro"/>
   <xacro:include filename="$(find fairino_sim)/config/frcobot_tool.xacro"/>
 
-  <xacro:frcobot_gz controllers_file="$(arg controllers_file)"/>
-  <xacro:frcobot_gz_ros2_control initial_positions="$(arg initial_positions)"/>
+  <xacro:frcobot_gz controllers_file="$(arg controllers_file)"
+                    gripper_controllers_file="$(arg gripper_controllers_file)"/>
+  <xacro:frcobot_gz_ros2_control initial_positions="$(arg initial_positions)"
+                                 fingers="$(arg finger_visual)"
+                                 finger_open="$(arg finger_stroke)"/>
   <xacro:frcobot_tool model="${model}"
                       visual="$(arg tool_visual)"
                       collision="$(arg tool_collision)"
@@ -42,7 +55,14 @@
                       mount_rpy="$(arg tool_mount_rpy)"
                       mass="$(arg tool_mass)"
                       tcp_xyz="$(arg tcp_xyz)"
-                      tcp_rpy="$(arg tcp_rpy)"/>
+                      tcp_rpy="$(arg tcp_rpy)"
+                      finger_visual="$(arg finger_visual)"
+                      finger_collision="$(arg finger_collision)"
+                      finger_scale="$(arg finger_scale)"
+                      finger_xyz="$(arg finger_xyz)"
+                      finger_stroke="$(arg finger_stroke)"
+                      finger_speed="$(arg finger_speed)"
+                      finger_mass="$(arg finger_mass)"/>
 
   <link name="world"/>
 
