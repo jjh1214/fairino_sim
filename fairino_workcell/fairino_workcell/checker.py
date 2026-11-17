@@ -41,6 +41,7 @@ class PathCheck:
     min_clearance: float = -1.0         # metres, -1 if not computed
     closest_body: str = ''
     closest_object: str = ''
+    clearance_at: float = -1.0          # where min_clearance is (like collision_at)
     tcp_path: list = field(default_factory=list)     # TCP positions along the path
     end_joints: tuple = ()
 
@@ -250,12 +251,13 @@ class Checker:
         body = min(per_body, key=per_body.get)
         return max(float(distance), 0.0), body, obj
 
-    def touching(self, held_name):
-        """Return the cell objects that a held object touches in the current state."""
+    def touching(self, held_name, within=0.0):
+        """Return the cell objects that a held object touches (or is within metres of)."""
         result = []
         for obj in self.world:
             acm = self._env_acm(set(), only_object=obj, only_body=held_name)
-            if self._check(acm)[0]:
+            if self._check(acm)[0] or (within > 0.0 and self._check(
+                    self._clearance_acm(set(), obj, held_name), distance=True)[1] < within):
                 result.append(obj)
         return result
 
@@ -315,6 +317,7 @@ class Checker:
         go_to(best, copies=True)
         result.min_clearance, result.closest_body, result.closest_object = self.clearance(
             allowed_pairs)
+        result.clearance_at = float(samples[best][0])
         return result
 
     def _distance(self, allowed_pairs):

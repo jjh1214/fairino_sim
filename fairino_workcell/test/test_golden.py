@@ -8,16 +8,21 @@ show up here.
 """
 
 import importlib.util
+import math
 import os
 import sys
 
+
 from fairino_workcell.api import OfflineWorkcell, RecipeError
+from fairino_workcell.motion import matrix_rpy, transform
+from fairino_workcell.robot_cell import new_report
 import numpy as np
 import pytest
 import yaml
 
 EXAMPLES = os.path.join(os.path.dirname(__file__), '..', 'examples', 'conveyor_cell')
 CELL = os.path.join(EXAMPLES, 'cell.yaml')
+TRACKING = os.path.join(EXAMPLES, 'tracking_cell.yaml')
 READY = 'conveyor/part_ready'
 
 
@@ -41,9 +46,9 @@ def checked(cell_file=CELL, **kwargs):
     return OfflineWorkcell(cell_file, stop_on_failure=False, **kwargs)
 
 
-def cell_with(tmp_path, **conveyor):
-    """Write the example cell with other conveyor settings (mesh paths made absolute)."""
-    data = yaml.safe_load(open(CELL))
+def cell_with(tmp_path, source=CELL, **conveyor):
+    """Write an example cell with other conveyor settings (mesh paths made absolute)."""
+    data = yaml.safe_load(open(source))
     for entry in data['parts'] + data['objects']:
         for key in ('visual', 'collision'):
             if key in entry:
@@ -81,9 +86,9 @@ def test_index_cycle_places_four_parts():
                            atol=1e-6)
     summary = cell.summary()
     assert summary['grips'] == 4
-    assert summary['cycle_time'] == pytest.approx(57.69, abs=0.05)
+    assert summary['cycle_time'] == pytest.approx(54.22, abs=0.05)
     assert summary['waiting'] == pytest.approx(0.64, abs=0.01)
-    assert summary['grip_interval'] == pytest.approx(13.39, abs=0.05)
+    assert summary['grip_interval'] == pytest.approx(12.46, abs=0.05)
     # the conveyor has brought its four parts and stands still
     assert cell.state.belts['conveyor'].fed == 4 and not cell.state.io[READY]
 
@@ -167,6 +172,123 @@ def test_io_steps(example):
     report = cell.set_io(READY, False)
     assert report['status'] == 'FAILED' and 'part sensor of conveyor conveyor' in report['message']
     assert cell.wait(2.5)['duration'] == 2.5 and cell.state.time == pytest.approx(2.5)
+
+
+def above_station(cell, example):
+    cell.move_joints(example.HOME)
+    cell.move_to('conveyor/station', xyz=(0, 0, example.GRASP_HEIGHT + example.APPROACH),
+                 rpy_deg=example.AT_CONVEYOR)
+    cell.wait_io(READY)
+
+
+def line_to_joints(cell, joints_deg, **kwargs):
+    """Move the TCP in a line to where it is at the given joints."""
+    target = cell.core.arm.fk(np.radians(joints_deg))
+    return cell.move_line('world', xyz=target[:3, 3],
+                          rpy_deg=np.degrees(matrix_rpy(target[:3, :3])), **kwargs)
+
+
+def test_a_line_moves_the_tcp_straight(example):
+    cell = checked()
+    above_station(cell, example)
+    target = cell.core.frame_matrix('conveyor/station', cell.state) @ transform(
+        (0, 0, example.GRASP_HEIGHT), np.radians(example.AT_CONVEYOR))
+    plan = cell.core.plan_cartesian(cell.state, target, 0.1, ['part'],
+                                    new_report('pick', 'move', True))
+    path = np.array(plan.check.tcp_path)
+    direction = (path[-1] - path[0]) / np.linalg.norm(path[-1] - path[0])
+    assert np.linalg.norm(np.cross(path - path[0], direction), axis=1).max() < 1e-6
+    assert np.allclose(path[-1], target[:3, 3], atol=1e-6)
+    assert plan.profile.duration == pytest.approx(2.0)      # 0.15 m at 0.1 m/s, 0.2 m/s2
+
+
+def test_an_arc_over_the_table(example):
+    cell = checked()
+    cell.move_joints(example.HOME)
+    cell.move_to('table/place', xyz=(0, 0, 0.18), rpy_deg=example.AT_TABLE)
+    report = cell.move_arc('table/place', via=(0.1, 0.1, 0.18), xyz=(0.2, 0, 0.18),
+                           rpy_deg=example.AT_TABLE)
+    assert report['status'] == 'OK' and report['message'] == 'arc is free'
+    place = cell.core.frame_matrix('table/place', cell.state)
+    end = cell.core.arm.fk(np.radians(report['end_joints_deg']))
+    assert np.allclose(end[:3, 3], (place @ transform((0.2, 0, 0.18)))[:3, 3], atol=3e-4)
+    assert report['duration'] == pytest.approx(1.55, abs=0.01)    # half circle of r = 0.1 m
+
+
+def test_a_line_into_the_part_collides(example):
+    cell = checked()
+    above_station(cell, example)
+    report = cell.move_line('conveyor/station', xyz=(0, 0, example.GRASP_HEIGHT),
+                            rpy_deg=example.AT_CONVEYOR, speed=0.1, name='pick, no contact')
+    assert report['status'] == 'FAILED'
+    assert report['collisions'] == ['tool_link <-> part_1'] and report['collision_at'] > 0.5
+
+
+def test_a_line_through_the_wrist_singularity_fails():
+    cell = checked(joints=np.radians([0, -90, 90, -90, 30, 0]))
+    report = line_to_joints(cell, [0, -90, 90, -90, -30, 0])
+    assert report['status'] == 'FAILED'
+    assert report['message'].startswith('j6 leaves its limits at ')
+    assert 'after passing close to the wrist singularity' in report['message']
+
+
+def test_a_line_close_to_the_wrist_singularity_warns():
+    cell = checked(joints=np.radians([0, -90, 90, -90, 12, 0]))
+    report = line_to_joints(cell, [0, -90, 90, -90, 2.5, 40], speed=1.0)
+    assert report['status'] == 'WARNING'
+    assert report['message'] == ('line is free; passes close to the wrist singularity at 100% '
+                                 '(j5 2.5 deg)')
+
+
+def test_a_line_slows_down_for_the_joint_speed_limits(example):
+    cell = checked()
+    cell.core.max_velocity = [math.radians(30)] * 6       # slow joints: 30 deg/s
+    above_station(cell, example)
+    report = cell.move_line('conveyor/station', xyz=(0.3, 0, 0.18), rpy_deg=example.AT_CONVEYOR,
+                            speed=1.0)
+    assert report['status'] == 'WARNING'
+    assert 'slowed down to ' in report['message']
+    assert 'by the speed limit of j' in report['message']
+
+
+def test_pick_on_the_move_cycle():
+    cell = checked(TRACKING)
+    load_example('pick_on_the_move').recipe(cell)
+    assert all(r['status'] == 'OK' for r in cell.reports) and len(cell.reports) == 30
+    picks = [r for r in cell.reports if r['kind'] == 'pick']
+    assert [r['message'].split(':')[0] for r in picks] == [
+        f'picked part_{n} on the move' for n in range(1, 5)]
+    place = cell.core.frame_matrix('table/place', cell.state)[:3, 3]
+    for number, (x, y) in enumerate([(-0.08, -0.08), (0.08, -0.08), (-0.08, 0.08),
+                                     (0.08, 0.08)], 1):
+        assert np.allclose(cell.object_pose(f'part_{number}')[:3, 3], place + (x, y, 0),
+                           atol=1e-6)
+    summary = cell.summary()
+    assert summary['grips'] == 4 and summary['missed'] == 0
+    assert summary['grip_interval'] == pytest.approx(15.0, abs=0.01)   # the belt feeds every 15 s
+    assert summary['cycle_time'] == pytest.approx(66.42, abs=0.05)
+    assert summary['waiting'] == pytest.approx(6.79, abs=0.02)
+
+
+def test_parts_too_far_to_catch_are_missed(tmp_path):
+    cell = checked(cell_with(tmp_path, TRACKING, speed=0.1, spacing=0.3))
+    load_example('pick_on_the_move').recipe(cell)
+    picks = [r for r in cell.reports if r['kind'] == 'pick' and r['status'] == 'OK']
+    picked = [r['message'].split(':')[0] for r in picks]
+    assert picked == ['picked part_1 on the move', 'picked part_4 on the move']
+    assert picks[1]['message'].endswith('(part_2, part_3 too far to catch)')
+    missed = sorted(part for r in cell.reports for part in r['missed_parts'])
+    assert missed == ['part_2', 'part_3']
+    assert cell.summary()['missed'] == 2
+
+
+def test_picking_on_the_move_needs_a_part_past_the_sensor():
+    report = checked(TRACKING).pick_moving('conveyor')
+    assert report['status'] == 'FAILED'
+    assert report['message'] == ('no part has passed the sensor of conveyor conveyor: '
+                                 'wait for conveyor/part_ready first')
+    report = checked().pick_moving('conveyor')
+    assert report['message'] == "'conveyor' is not a continuous conveyor"
 
 
 def test_joint_limits():

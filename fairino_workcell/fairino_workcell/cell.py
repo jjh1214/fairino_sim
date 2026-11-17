@@ -21,7 +21,8 @@ ROBOT_KEYS = ('model', 'base', 'initial_positions', 'initial_positions_deg', 'to
 SHAPE_KEYS = ('name', 'visual', 'collision', 'units', 'box', 'cylinder', 'color', 'frames')
 OBJECT_KEYS = SHAPE_KEYS + ('pose', 'touch_links', 'movable', 'conveyor')
 PART_KEYS = SHAPE_KEYS
-CONVEYOR_KEYS = ('part', 'entry', 'station', 'speed', 'spacing', 'count')
+CONVEYOR_KEYS = ('part', 'entry', 'station', 'exit', 'mode', 'speed', 'spacing', 'count')
+CONVEYOR_MODES = ('index', 'continuous')
 VISUAL_FORMATS = ('.glb', '.gltf', '.dae', '.obj', '.stl')
 EMBEDDED_MATERIAL_FORMATS = ('.glb', '.gltf', '.dae')
 DEFAULT_COLOR = (0.62, 0.64, 0.68, 1.0)
@@ -57,14 +58,22 @@ class Geometry:
 
 @dataclass(frozen=True)
 class Conveyor:
-    """An index conveyor: parts travel from the entry frame to the station frame and stop."""
+    """
+    A conveyor that brings parts, put on its belt at the entry frame.
+
+    index: the parts travel to the station frame and stop there. continuous: the belt keeps
+    running; a part passing the station frame (a sensor) can be picked on the move, and parts
+    that reach the exit frame leave the cell.
+    """
 
     part: str          # part type put on the belt
     entry: str         # frame of the object where parts are put on the belt
-    station: str       # frame of the object where parts stop
+    station: str       # frame where parts stop (index), or the sensor (continuous)
     speed: float       # belt speed [m/s]
     spacing: float     # distance between parts on the belt [m]
     count: int = 0     # parts to put on the belt; 0: no limit
+    mode: str = 'index'
+    exit_frame: str = ''   # continuous: frame where parts leave the belt (key exit)
 
 
 @dataclass(frozen=True)
@@ -307,17 +316,32 @@ def _conveyor(data, frames, part_types, where):
     if not isinstance(data, dict):
         raise CellError(f'{where} must be a mapping')
     _check_keys(data, CONVEYOR_KEYS, where)
-    missing = [key for key in ('part', 'entry', 'station', 'speed', 'spacing') if key not in data]
+    mode = data.get('mode', 'index')
+    if mode not in CONVEYOR_MODES:
+        raise CellError(f'{where}: mode must be one of {", ".join(CONVEYOR_MODES)}')
+    required = ['part', 'entry', 'station', 'speed', 'spacing'] + (
+        ['exit'] if mode == 'continuous' else [])
+    missing = [key for key in required if key not in data]
     if missing:
         raise CellError(f'{where}: {", ".join(missing)} required')
+    if mode == 'index' and 'exit' in data:
+        raise CellError(f'{where}: exit is only for continuous conveyors (parts stop at the '
+                        'station of an index conveyor)')
     if data['part'] not in part_types:
         raise CellError(f"{where}: part {data['part']!r} is not a part type (see parts)")
-    for key in ('entry', 'station'):
-        if data[key] not in frames:
+    for key in ('entry', 'station', 'exit'):
+        if key in data and data[key] not in frames:
             raise CellError(f'{where}: {key} {data[key]!r} is not a frame of the object')
     entry, station = frames[data['entry']].xyz, frames[data['station']].xyz
     if math.dist(entry, station) < 1e-3:
         raise CellError(f'{where}: entry and station must be at different places')
+    if mode == 'continuous':
+        end = frames[data['exit']].xyz
+        along = [b - a for a, b in zip(entry, end)]
+        length = math.hypot(*along)
+        sensor = sum((s - e) * d for s, e, d in zip(station, entry, along)) / max(length, 1e-9)
+        if length < 1e-3 or not 0.0 < sensor < length:
+            raise CellError(f'{where}: the station (sensor) must be between entry and exit')
     values = {}
     for key in ('speed', 'spacing'):
         try:
@@ -330,7 +354,8 @@ def _conveyor(data, frames, part_types, where):
     if isinstance(count, bool) or not isinstance(count, int) or count < 0:
         raise CellError(f'{where}: count must be a whole number, 0 for no limit')
     return Conveyor(part=data['part'], entry=data['entry'], station=data['station'],
-                    speed=values['speed'], spacing=values['spacing'], count=count)
+                    speed=values['speed'], spacing=values['spacing'], count=count, mode=mode,
+                    exit_frame=data.get('exit', ''))
 
 
 def _flag(value, what, where):

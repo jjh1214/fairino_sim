@@ -31,9 +31,9 @@ import threading
 
 from action_msgs.msg import GoalStatus
 from fairino_workcell.cell import load_cell
-from fairino_workcell.motion import matrix_quaternion, pose_matrix, rpy_matrix
+from fairino_workcell.motion import matrix_quaternion, rpy_matrix
 from fairino_workcell.robot_cell import DEFAULT_SPEED, new_report, RobotCell, StepError
-from fairino_workcell_msgs.action import Move
+from fairino_workcell_msgs.action import Move, PickMoving
 from fairino_workcell_msgs.msg import StepReport
 from fairino_workcell_msgs.srv import Gripper, SetIO, Wait
 from geometry_msgs.msg import PoseStamped
@@ -43,6 +43,15 @@ from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from std_srvs.srv import Trigger
 
 STATUS = {StepReport.OK: 'OK', StepReport.WARNING: 'WARNING', StepReport.FAILED: 'FAILED'}
+
+
+def _pose_stamped(frame, xyz, rpy_deg):
+    pose = PoseStamped()
+    pose.header.frame_id = frame
+    pose.pose.position.x, pose.pose.position.y, pose.pose.position.z = (float(v) for v in xyz)
+    o = pose.pose.orientation
+    o.x, o.y, o.z, o.w = matrix_quaternion(rpy_matrix(*(math.radians(v) for v in rpy_deg)))
+    return pose
 
 
 class RecipeError(RuntimeError):
@@ -66,7 +75,7 @@ def report_dict(msg):
         'allowed_contacts': list(msg.allowed_contacts),
         'start_joints_deg': [round(math.degrees(v), 2) for v in msg.start_joints],
         'end_joints_deg': [round(math.degrees(v), 2) for v in msg.end_joints],
-        'held_object': msg.held_object,
+        'held_object': msg.held_object, 'missed_parts': list(msg.missed_parts),
     }
 
 
@@ -86,6 +95,7 @@ class Workcell:
         self._thread = threading.Thread(target=self._spin, daemon=True)
         self._thread.start()
         self._move = ActionClient(self.node, Move, '/workcell/move')
+        self._pick_moving = ActionClient(self.node, PickMoving, '/workcell/pick_moving')
         self._gripper = self.node.create_client(Gripper, '/workcell/gripper')
         self._wait_service = self.node.create_client(Wait, '/workcell/wait')
         self._set_io = self.node.create_client(SetIO, '/workcell/set_io')
@@ -126,19 +136,51 @@ class Workcell:
 
         The default orientation points the tool down onto the frame (180 degrees about x).
         """
-        pose = PoseStamped()
-        pose.header.frame_id = frame
-        pose.pose.position.x, pose.pose.position.y, pose.pose.position.z = (
-            float(v) for v in xyz)
-        q = matrix_quaternion(rpy_matrix(*(math.radians(v) for v in rpy_deg)))
-        o = pose.pose.orientation
-        o.x, o.y, o.z, o.w = q
-        return self.move_pose(pose, speed, name or f'to {frame}', allow_contact)
+        return self.move_pose(_pose_stamped(frame, xyz, rpy_deg), speed, name or f'to {frame}',
+                              allow_contact)
 
-    def move_pose(self, pose, speed=None, name=None, allow_contact=()):
+    def move_pose(self, pose, speed=None, name=None, allow_contact=(), motion=Move.Goal.PTP):
         """Move the TCP to a geometry_msgs/PoseStamped (frame: world or a cell frame)."""
-        goal = Move.Goal(target_type=Move.Goal.POSE, pose=pose)
+        goal = Move.Goal(target_type=Move.Goal.POSE, pose=pose, motion=motion)
         return self._run_move(goal, speed, name, allow_contact)
+
+    def move_line(self, frame, xyz=(0.0, 0.0, 0.0), rpy_deg=(180.0, 0.0, 0.0), speed=None,
+                  name=None, allow_contact=()):
+        """
+        Move the TCP in a straight line (like MoveL) to a pose given in a cell frame.
+
+        speed is a fraction of the TCP speed limits. The orientation turns uniformly on the
+        way; the move fails where the arm would pass a singularity or leave a joint limit.
+        """
+        goal = Move.Goal(target_type=Move.Goal.POSE, motion=Move.Goal.LIN,
+                         pose=_pose_stamped(frame, xyz, rpy_deg))
+        return self._run_move(goal, speed, name or f'line to {frame}', allow_contact)
+
+    def move_arc(self, frame, via, xyz, rpy_deg=(180.0, 0.0, 0.0), speed=None, name=None,
+                 allow_contact=()):
+        """Move the TCP along the arc through via to xyz, both in frame (like MoveC)."""
+        goal = Move.Goal(target_type=Move.Goal.POSE, motion=Move.Goal.CIRC,
+                         pose=_pose_stamped(frame, xyz, rpy_deg),
+                         via=_pose_stamped(frame, via, (0.0, 0.0, 0.0)))
+        return self._run_move(goal, speed, name or f'arc to {frame}', allow_contact)
+
+    def pick_moving(self, conveyor, approach=0.1, lift=0.1, rpy_deg=(180.0, 0.0, 0.0),
+                    speed=None, grip_time=0.3, part='', name=None):
+        """
+        Pick a part on the move from a continuous conveyor (conveyor tracking).
+
+        One checked motion: the TCP comes in step with the part approach metres above its
+        grasp pose (rpy_deg relative to the part's grasp frame), goes down to it while
+        following it, follows it for grip_time while the gripper closes, lifts it lift metres
+        while still following the belt, and stops. The part is the first one past the
+        conveyor sensor unless part is given; afterwards it is in the gripper.
+        """
+        goal = PickMoving.Goal(conveyor=conveyor, part=part, approach=float(approach),
+                               lift=float(lift), grip_time=float(grip_time),
+                               speed=float(speed or self.speed or 0.0),
+                               check_only=self.check_only, name=name or f'pick from {conveyor}')
+        goal.grasp = _pose_stamped('', (0.0, 0.0, 0.0), rpy_deg).pose
+        return self._record(self._send_pick_moving(goal))
 
     def grip(self, name=None):
         """Close the gripper on the object whose grasp frame is at the TCP."""
@@ -175,13 +217,14 @@ class Workcell:
         """Return counts and times of the run: cycle time, waiting, parts gripped."""
         counts = {status: sum(r['status'] == status for r in self.reports)
                   for status in STATUS.values()}
-        grips = [r['start_time'] for r in self.reports if r['kind'] == 'grip'
+        grips = [r['start_time'] for r in self.reports if r['kind'] in ('grip', 'pick')
                  and r['status'] != 'FAILED']
         intervals = [b - a for a, b in zip(grips, grips[1:])]
         return {'mode': self.mode, 'cycle_time': round(self.cycle_time, 3),
                 'waiting': round(sum(r['duration'] for r in self.reports
                                      if r['kind'] == 'wait'), 3),
                 'grips': len(grips),
+                'missed': sum(len(r['missed_parts']) for r in self.reports),
                 'grip_interval': round(sum(intervals) / len(intervals), 3) if intervals else None,
                 'steps': len(self.reports), **{k.lower(): v for k, v in counts.items()}}
 
@@ -209,6 +252,8 @@ class Workcell:
             text += f" | waiting {s['waiting']:.2f} s"
         if s['grip_interval'] is not None:
             text += f" | {s['grips']} parts gripped, one every {s['grip_interval']:.2f} s"
+        if s['missed']:
+            text += f" | {s['missed']} parts missed"
         return text
 
     def print_report(self, stream=sys.stdout):
@@ -234,6 +279,17 @@ class Workcell:
 
     def _send_move(self, goal):
         handle = self._wait(self._move.send_goal_async(goal), 30.0)
+        if handle is None or not handle.accepted:
+            raise RuntimeError(f"step '{goal.name}' was not accepted by the executor")
+        result = self._wait(handle.get_result_async(), 600.0)
+        if result is None:
+            raise RuntimeError(f"step '{goal.name}' did not finish")
+        if result.status != GoalStatus.STATUS_SUCCEEDED and not result.result.report.name:
+            raise RuntimeError(f"step '{goal.name}' was aborted by the executor (see its log)")
+        return result.result.report
+
+    def _send_pick_moving(self, goal):
+        handle = self._wait(self._pick_moving.send_goal_async(goal), 30.0)
         if handle is None or not handle.accepted:
             raise RuntimeError(f"step '{goal.name}' was not accepted by the executor")
         result = self._wait(handle.get_result_async(), 600.0)
@@ -328,17 +384,20 @@ class OfflineWorkcell(Workcell):
     def _send_move(self, goal):
         report = self._report(goal.name, 'move')
         try:
-            if goal.target_type == Move.Goal.JOINTS:
-                target = tuple(goal.joints)
-            else:
-                p, o = goal.pose.pose.position, goal.pose.pose.orientation
-                target = self.core.pose_target(self.state, goal.pose.header.frame_id,
-                                               pose_matrix((p.x, p.y, p.z), (o.x, o.y, o.z, o.w)))
-            plan = self.core.plan_move(self.state, target, goal.speed or DEFAULT_SPEED,
-                                       goal.allowed_contacts, report)
+            plan = self.core.plan_goal(self.state, goal, DEFAULT_SPEED, report)
             if report.status != StepReport.FAILED:
                 self.core.advance(self.state, plan.profile.duration)
                 self.core.complete_move(self.state, plan.goal)
+        except StepError as exc:
+            report.status, report.message = StepReport.FAILED, str(exc)
+        return self._finish(report)
+
+    def _send_pick_moving(self, goal):
+        report = self._report(goal.name, 'pick')
+        try:
+            plan = self.core.plan_pick_goal(self.state, goal, DEFAULT_SPEED, report)
+            if report.status != StepReport.FAILED:
+                self.core.complete_pick(self.state, plan)
         except StepError as exc:
             report.status, report.message = StepReport.FAILED, str(exc)
         return self._finish(report)
@@ -375,11 +434,14 @@ class OfflineWorkcell(Workcell):
     def _report(self, name, kind):
         report = new_report(name, kind, True, self.state.time)
         report.start_joints = list(self.state.joints)
+        self._missed_before = list(self.core.conveyors.missed(self.state))
         return report
 
     def _finish(self, report):
         report.end_joints = list(self.state.joints)
         report.held_object = next(iter(self.state.held), '')
+        report.missed_parts = [part for part in self.core.conveyors.missed(self.state)
+                               if part not in self._missed_before]
         return report
 
     def object_pose(self, name):

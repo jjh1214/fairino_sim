@@ -1,11 +1,16 @@
 """
-Index conveyors: parts travel on a straight belt from an entry frame to a station frame.
+Conveyors: parts travel on a straight belt, put on it at an entry frame at a fixed spacing.
 
-Parts stop at the station. The belt stands still while a part waits there and runs again as
-soon as the part is taken; parts follow each other at a fixed spacing. The IO
-<conveyor>/part_ready is true while a part waits at the station. The model is deterministic, so
-a check can run it in virtual time and predict where every part will be during a move or a
-wait.
+Index conveyors bring the parts to a station frame where they stop. The belt stands still while
+a part waits there and runs again as soon as the part is taken. The IO <conveyor>/part_ready is
+true while a part waits at the station.
+
+Continuous conveyors keep running. The station frame is a sensor: <conveyor>/part_ready is true
+while a part that has passed it is still on the belt, to be picked on the move. Parts that
+reach the exit frame leave the cell; they are recorded as missed.
+
+The model is deterministic, so a check can run it in virtual time and predict where every part
+will be during a move or a wait.
 """
 
 from dataclasses import dataclass, field
@@ -24,9 +29,11 @@ class Belt:
     items: list = field(default_factory=list)   # [part name, distance from the entry], lead first
     fed: int = 0                                 # parts put on the belt so far
     travel: float = math.inf                     # belt travel since the last part was put on
+    missed: list = field(default_factory=list)   # parts that left at the exit (continuous)
 
     def copy(self):
-        return Belt([list(item) for item in self.items], self.fed, self.travel)
+        return Belt([list(item) for item in self.items], self.fed, self.travel,
+                    list(self.missed))
 
     def take(self, name):
         """Take a part off the belt; return True if it was on it."""
@@ -38,39 +45,57 @@ class Belt:
 
 
 class ConveyorModel:
-    """Path and rules of one index conveyor."""
+    """Path and rules of one conveyor."""
 
-    def __init__(self, name, spec, entry, station):
-        """Make the model of the conveyor spec of object name; entry, station: 4x4 world poses."""
-        self.name, self.part = name, spec.part
+    def __init__(self, name, spec, entry, station, exit_pose=None):
+        """Make the model of the conveyor spec of object name; frames as 4x4 world poses."""
+        self.name, self.part, self.mode = name, spec.part, spec.mode
         self.speed, self.spacing, self.count = spec.speed, spec.spacing, spec.count
+        self.continuous = spec.mode == 'continuous'
         self.origin = np.array(entry[:3, 3], dtype=float)
-        offset = np.asarray(station[:3, 3], dtype=float) - self.origin
-        self.length = float(np.linalg.norm(offset))
+        end = exit_pose if self.continuous else station
+        offset = np.asarray(end[:3, 3], dtype=float) - self.origin
+        self.length = float(np.linalg.norm(offset))       # to the station (index) or the exit
         self.direction = offset / self.length
+        self.velocity = self.speed * self.direction
+        self.sensor = (float(np.dot(np.asarray(station[:3, 3]) - self.origin, self.direction))
+                       if self.continuous else self.length)
         self.rotation = np.array(station[:3, :3], dtype=float)
         self.io = ready_io(name)
 
     def ready(self, belt):
-        """Return True while a part waits at the station."""
+        """Return True while a part waits at the station, or has passed the sensor."""
+        if self.continuous:
+            return any(distance >= self.sensor - EPS for _, distance in belt.items)
         return bool(belt.items) and belt.items[0][1] >= self.length - EPS
+
+    def ready_part(self, belt):
+        """Return the part to pick: at the station, or the first one past the sensor."""
+        if self.ready(belt):
+            return belt.items[0][0]
+        return None
 
     def can_feed(self, belt):
         return self.count == 0 or belt.fed < self.count
 
     def running(self, belt):
+        if self.continuous:
+            return bool(belt.items) or self.can_feed(belt)
         return not self.ready(belt) and (bool(belt.items) or self.can_feed(belt))
 
     def feed_due(self, belt):
         return self.can_feed(belt) and belt.travel >= self.spacing - EPS
 
     def time_to_event(self, belt):
-        """Return the time until a part arrives or is put on the belt (inf: standing still)."""
+        """Return the time until a part arrives, passes the sensor, leaves or is put on."""
         if not self.running(belt):
             return math.inf
         times = []
         if belt.items:
             times.append((self.length - belt.items[0][1]) / self.speed)
+        if self.continuous:
+            times += [(self.sensor - distance) / self.speed for _, distance in belt.items
+                      if distance < self.sensor - EPS]
         if self.can_feed(belt):
             times.append((self.spacing - belt.travel) / self.speed)
         return max(0.0, min(times))
@@ -81,6 +106,15 @@ class ConveyorModel:
         for item in belt.items:
             item[1] = min(item[1] + distance, self.length)
         belt.travel += distance
+
+    def leave(self, belt):
+        """Take the parts that reached the exit off a continuous belt; return their names."""
+        if not self.continuous:
+            return []
+        gone = [name for name, distance in belt.items if distance >= self.length - EPS]
+        belt.items = [item for item in belt.items if item[0] not in gone]
+        belt.missed.extend(gone)
+        return gone
 
     def pose(self, distance):
         """Return the 4x4 world pose of a part at a distance from the entry."""
@@ -126,6 +160,9 @@ class Conveyors:
                 model.run(belt, step)
             state.time += step
             remaining -= step
+            for model, belt in running:
+                for part in model.leave(belt):
+                    state.poses.pop(part, None)
             new += self._feed(state)
         state.time += remaining
         self._update(state)
@@ -201,6 +238,12 @@ class Conveyors:
     def _update(self, state):
         for name, model in self.models.items():
             belt = state.belts[name]
+            for part in model.leave(belt):
+                state.poses.pop(part, None)
             for part, distance in belt.items:
                 state.poses[part] = model.pose(distance)
             state.io[model.io] = model.ready(belt)
+
+    def missed(self, state):
+        """Return the parts that left continuous conveyors without being picked."""
+        return [part for belt in state.belts.values() for part in belt.missed]

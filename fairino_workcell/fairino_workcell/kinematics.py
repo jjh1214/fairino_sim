@@ -230,6 +230,43 @@ class Arm:
             result.append(np.array((q1, q2, q3, q234 - q2 - q3, q5, q6)))
         return result
 
+    def follow(self, target, previous, iterations=20):
+        """
+        Return the joints for a 4x4 tip pose (root frame) close to previous, or None.
+
+        Newton steps from previous keep the arm configuration, so a Cartesian path followed
+        in small steps stays on one branch of the solutions.
+        """
+        joints = np.array(previous, dtype=float)
+        for _ in range(iterations):
+            jacobian, tip = self.jacobian(joints)
+            error = _twist_error(target, tip)
+            if np.max(np.abs(error)) < 1e-12:
+                break
+            step = np.linalg.lstsq(jacobian, error, rcond=None)[0]
+            largest = float(np.max(np.abs(step)))
+            if largest > 0.5:                   # near a singularity: do not jump far
+                step *= 0.5 / largest
+            joints = joints + step
+        distance, angle = pose_error(target, self.fk(joints))
+        if distance > POSITION_TOLERANCE or angle > ANGLE_TOLERANCE:
+            return None
+        return joints
+
+    def singularity(self, joints):
+        """
+        Return how far the joints are from the singularities of the UR layout.
+
+        (wrist, elbow, shoulder): |sin j5| and |sin j3| (0 at the wrist and elbow
+        singularities), and the distance in metres of the wrist centre from the cylinder
+        around j1 where the two shoulder solutions meet.
+        """
+        frames, _ = self.frames(joints)
+        centre = inverse(self.origins[0]) @ frames[5][:, 3]
+        d4 = self.parameters[3]
+        shoulder = math.sqrt(max(centre[0] ** 2 + centre[1] ** 2 - d4 ** 2, 0.0))
+        return abs(math.sin(joints[4])), abs(math.sin(joints[2])), shoulder
+
     def _refine(self, joints, target, iterations=10):
         """Newton steps on the URDF kinematics (the layout is only ideal up to rounding)."""
         joints = np.array(joints, dtype=float)

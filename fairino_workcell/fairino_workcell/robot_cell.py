@@ -27,11 +27,12 @@ import math
 import xml.etree.ElementTree as ET
 
 from fairino_sim import description
-from fairino_workcell import motion
+from fairino_workcell import cartesian, motion, tracking
 from fairino_workcell.checker import Checker, PathCheck
 from fairino_workcell.conveyor import ConveyorModel, Conveyors
 from fairino_workcell.kinematics import Arm
 from fairino_workcell.state import CellState
+from fairino_workcell_msgs.action import Move
 from fairino_workcell_msgs.msg import StepReport
 import numpy as np
 
@@ -41,6 +42,11 @@ DEFAULT_SPEED = 0.3       # fraction of the joint velocity and acceleration limi
 WAIT_LIMIT = 600.0        # longest wait a check simulates when no timeout is given [s]
 PART_STEP = 0.005         # largest distance a part moves between two check samples [m]
 FAR = motion.transform((0.0, 0.0, -1000.0))    # where parts are before they are put in
+TURN_SPEED, TURN_ACCELERATION = math.pi, 2.0 * math.pi    # TCP orientation limits (rad/s, /s2)
+WRIST_WARNING = math.sin(math.radians(5.0))    # Cartesian moves closer to a singularity warn
+ELBOW_WARNING = math.sin(math.radians(5.0))
+SHOULDER_WARNING = 0.02                        # m
+CONTACT_DISTANCE = 1e-4   # m: closer than this counts as touching, a collision unless allowed
 
 
 class StepError(RuntimeError):
@@ -49,12 +55,23 @@ class StepError(RuntimeError):
 
 @dataclass
 class MovePlan:
-    """A checked PTP move."""
+    """A checked move: PTP in joint space, or LIN and CIRC along a TCP path."""
 
     start: tuple
     goal: tuple
     profile: motion.Profile
     check: PathCheck
+    path: cartesian.CartesianPath = None
+    samples: list = None          # [(path fraction, joints)] of a LIN or CIRC move
+    arm: Arm = None
+
+    def trajectory(self, dt):
+        """Return times, joint positions, velocities and accelerations (or None) every dt."""
+        if self.path is None:
+            return motion.sample_ptp(self.start, self.goal, self.profile, dt)
+        times, positions, velocities = cartesian.trajectory(self.arm, self.path, self.profile,
+                                                            self.samples, dt)
+        return times, positions, velocities, None
 
 
 @dataclass
@@ -63,6 +80,28 @@ class WaitPlan:
 
     duration: float          # predicted waiting time; None: until another program sets the IO
     check: PathCheck = None  # parts moving during the wait; None when nothing moves
+
+
+@dataclass
+class PickPlan:
+    """A checked pick on the move from a continuous conveyor."""
+
+    part: str
+    start: tuple
+    goal: tuple
+    profile: tracking.Timeline
+    check: PathCheck
+    path: tracking.TrackingMotion
+    samples: list                 # [(time fraction, joints)]
+    arm: Arm
+    grip_at: float                # s from the start of the step
+    offset: np.ndarray            # part pose relative to the TCP once gripped
+
+    def trajectory(self, dt):
+        """Return times, joint positions, velocities and None (no accelerations) every dt."""
+        times, positions, velocities = cartesian.trajectory(self.arm, self.path, self.profile,
+                                                            self.samples, dt)
+        return times, positions, velocities, None
 
 
 def new_report(name, kind, check_only=False, start_time=0.0):
@@ -74,7 +113,8 @@ class RobotCell:
     """The robot of a cell file with its tool, and the objects and conveyors around it."""
 
     def __init__(self, cell, joint_acceleration=3.0, clearance_warning=0.01,
-                 grasp_tolerance=0.01, check_step=math.radians(0.5)):
+                 grasp_tolerance=0.01, check_step=math.radians(0.5), tcp_speed=1.0,
+                 tcp_acceleration=2.0):
         robot = cell.robot
         tool = description.load_tool(robot.tool_file) if robot.tool_file else None
         package = description.moveit_config_package(robot.model)
@@ -90,6 +130,7 @@ class RobotCell:
         self.clearance_warning = clearance_warning
         self.grasp_tolerance = grasp_tolerance
         self.check_step = check_step
+        self.tcp_limits = (tcp_speed, tcp_acceleration, TURN_SPEED, TURN_ACCELERATION)
 
         self.cell = cell
         self.group = f'{robot.model}_group'
@@ -105,11 +146,11 @@ class RobotCell:
         models = {}
         for obj in cell.objects:
             if obj.conveyor is not None:
-                entry, station = (obj.frame(n) for n in (obj.conveyor.entry, obj.conveyor.station))
-                base = poses[obj.name]
-                models[obj.name] = ConveyorModel(
-                    obj.name, obj.conveyor, base @ motion.transform(entry.xyz, entry.rpy),
-                    base @ motion.transform(station.xyz, station.rpy))
+                frames = {name: poses[obj.name] @ motion.transform(pose.xyz, pose.rpy)
+                          for name, pose in obj.frames}
+                spec = obj.conveyor
+                models[obj.name] = ConveyorModel(obj.name, spec, frames[spec.entry],
+                                                 frames[spec.station], frames.get(spec.exit_frame))
         self.conveyors = Conveyors(models)
         self.sensors = self.conveyors.sensors
         self._parts = {}
@@ -185,6 +226,263 @@ class RobotCell:
         return self.solve_ik(self.frame_matrix(frame, state) @ pose, state.joints)
 
     # ---------------------------------------------------------------- steps
+    def plan_goal(self, state, goal, default_speed, report):
+        """Check the move of a Move goal (PTP, LIN or CIRC; joint or pose target)."""
+        speed = goal.speed or default_speed
+        pose = None
+        if goal.target_type == Move.Goal.JOINTS:
+            joints = tuple(float(v) for v in goal.joints)
+            if len(joints) != 6:
+                raise StepError(f'joints must have 6 values, got {len(joints)}')
+        elif goal.target_type == Move.Goal.POSE:
+            joints = None
+            p, o = goal.pose.pose.position, goal.pose.pose.orientation
+            pose = self.frame_matrix(goal.pose.header.frame_id, state) @ motion.pose_matrix(
+                (p.x, p.y, p.z), (o.x, o.y, o.z, o.w))
+        else:
+            raise StepError(f'unknown target_type {goal.target_type}')
+        if goal.motion == Move.Goal.PTP:
+            if joints is None:
+                joints = self.solve_ik(pose, state.joints)
+            return self.plan_move(state, joints, speed, goal.allowed_contacts, report)
+        if goal.motion not in (Move.Goal.LIN, Move.Goal.CIRC):
+            raise StepError(f'unknown motion {goal.motion}')
+        via = None
+        if goal.motion == Move.Goal.CIRC:
+            v = goal.via.pose.position
+            via = (self.frame_matrix(goal.via.header.frame_id, state)
+                   @ motion.transform((v.x, v.y, v.z)))[:3, 3]
+        if pose is None:
+            problems = motion.outside_limits(joints, self.lower, self.upper, JOINTS)
+            if problems:
+                raise StepError('outside the joint limits: ' + ', '.join(problems))
+            pose = self.arm.fk(joints)
+        return self.plan_cartesian(state, pose, speed, goal.allowed_contacts, report, via, joints)
+
+    def plan_cartesian(self, state, target, speed, allowed_contacts, report, via=None,
+                       joints=None):
+        """
+        Check a LIN move (via None) or a CIRC move through via of the TCP to target.
+
+        target is a 4x4 world pose, via a world point. joints, if given, are the joints the
+        move must end at. The joints follow the path continuously from the current joints;
+        passing a singularity or a joint limit fails, coming close to a singularity warns, and
+        the move slows down where a joint would turn faster than its limit.
+        """
+        if not 0.0 < speed <= 1.0:
+            raise StepError(f'speed must be in (0, 1], got {speed}')
+        start = np.asarray(state.joints, dtype=float)
+        try:
+            path = cartesian.CartesianPath(self.arm.fk(start), target, via)
+            samples = cartesian.follow(self.arm, path, start, self.lower, self.upper,
+                                       self.check_step)
+        except cartesian.PathError as exc:
+            raise StepError(str(exc)) from None
+        except ValueError as exc:
+            raise StepError(str(exc)) from None
+        end = samples[-1][1]
+        if joints is not None and np.max(np.abs(end - np.asarray(joints))) > 1e-3:
+            raise StepError('the path ends in another arm configuration than the given joints')
+
+        profile = path.profile(self.tcp_limits, speed)
+        notes = []
+        _, _, velocities = cartesian.trajectory(self.arm, path, profile, samples, 0.02)
+        ratios = np.max(np.abs(velocities), axis=0) / np.asarray(self.max_velocity)
+        if ratios.max() > 1.0:
+            factor = float(ratios.max())
+            profile = motion.Profile(profile.duration * factor, profile.accel_time * factor,
+                                     profile.peak_rate / factor, profile.accel / factor ** 2)
+            notes.append(f'slowed down to {100 / factor:.0f}% by the speed limit of '
+                         f'j{int(np.argmax(ratios)) + 1}')
+        report.duration = profile.duration
+        notes += self._singularity_notes(samples)
+
+        check = self._check_motion(
+            state, [profile.time_at(s) for s, _ in samples],
+            lambda t: cartesian.interpolate(samples, profile.at(t)[0]),
+            lambda t: profile.at(t)[0], allowed_contacts, report)
+        if check.collision_at >= 0.0:
+            report.status = StepReport.FAILED
+            report.message = 'collision at {:.0f}% of the path: {}'.format(
+                100 * check.collision_at, ', '.join(check.collisions) or 'self collision')
+        else:
+            self._clearance_status(check, report, f'{path.kind} is free')
+            if notes:
+                report.status = max(report.status, StepReport.WARNING)
+                report.message = '; '.join([report.message] + notes)
+        return MovePlan(tuple(start), tuple(float(v) for v in end), profile, check, path,
+                        samples, self.arm)
+
+    def _singularity_notes(self, samples):
+        """Return a note for every singularity the joints along a path come close to."""
+        notes = []
+        margins = np.array([self.arm.singularity(q) for _, q in samples])
+        for index, (limit, name, joint) in enumerate((
+                (WRIST_WARNING, 'wrist', 4), (ELBOW_WARNING, 'elbow', 2),
+                (SHOULDER_WARNING, 'shoulder', None))):
+            closest = int(np.argmin(margins[:, index]))
+            if margins[closest, index] < limit:
+                at, q = samples[closest]
+                value = (f'j{joint + 1} {math.degrees(q[joint]):.1f} deg' if joint is not None
+                         else f'{margins[closest, index] * 1000:.0f} mm')
+                notes.append(f'passes close to the {name} singularity at {100 * at:.0f}% '
+                             f'({value})')
+        return notes
+
+    def plan_pick_goal(self, state, goal, default_speed, report):
+        """Check the pick of a PickMoving goal."""
+        p, o = goal.grasp.position, goal.grasp.orientation
+        quaternion = (o.x, o.y, o.z, o.w) if any((o.x, o.y, o.z, o.w)) else (1.0, 0.0, 0.0, 0.0)
+        return self.plan_pick_moving(
+            state, goal.conveyor, goal.part, motion.pose_matrix((p.x, p.y, p.z), quaternion),
+            goal.approach, goal.lift, goal.speed or default_speed, goal.grip_time, report)
+
+    def plan_pick_moving(self, state, conveyor, part, grasp, approach, lift, speed, grip_time,
+                         report):
+        """
+        Check picking a part on the move from a continuous conveyor; fill the report.
+
+        grasp is the TCP pose relative to the part's grasp frame. The part is the given one, or
+        the first one past the sensor that can still be caught, as a tracking system skips
+        parts that are already too far (they leave the cell as missed parts). The motion is
+        checked in two phases: up to the grip with the part moving on the belt (the tool may
+        touch it), then with the part held. The state is not changed.
+        """
+        model = self.conveyors.models.get(conveyor)
+        if model is None or not model.continuous:
+            raise StepError(f"'{conveyor}' is not a continuous conveyor")
+        if state.held:
+            raise StepError(f'already holding {next(iter(state.held))}')
+        if not 0.0 < speed <= 1.0:
+            raise StepError(f'speed must be in (0, 1], got {speed}')
+        if approach <= 0.0 or lift <= 0.0 or grip_time < 0.0:
+            raise StepError('approach and lift must be positive, grip_time not negative')
+        belt = state.belts[conveyor]
+        if part:
+            if part not in [name for name, _ in belt.items]:
+                raise StepError(f'{part} is not on conveyor {conveyor}')
+            candidates = [part]
+        else:
+            candidates = [name for name, distance in belt.items
+                          if distance >= model.sensor - 1e-9]
+            if not candidates:
+                raise StepError(f'no part has passed the sensor of conveyor {conveyor}: '
+                                f'wait for {model.io} first')
+        problems = []
+        for candidate in candidates:
+            try:
+                path, timeline, samples = self._catch(state, model, candidate, grasp, approach,
+                                                      lift, speed, grip_time)
+                part = candidate
+                break
+            except StepError as exc:
+                problems.append(exc)
+        else:
+            raise problems[0]
+        skipped = candidates[:candidates.index(part)]
+        report.duration = path.duration
+        notes = self._singularity_notes(samples)
+
+        grip_u = path.grip_at / path.duration
+        q_grip = cartesian.interpolate(samples, grip_u)
+        exact = self.arm.follow(path.pose_at(path.grip_at), q_grip)    # exact at the grip
+        if exact is not None:
+            q_grip = exact
+        first = [u for u, _ in samples if u < grip_u] + [grip_u]
+        second = [grip_u] + [u for u, _ in samples if u > grip_u]
+        before, after = new_report('', 'move'), new_report('', 'move')
+        check1 = self._check_motion(
+            state, [timeline.time_at(u) for u in first],
+            lambda t: cartesian.interpolate(samples, t / path.duration),
+            lambda t: t / path.duration, [part], before)
+        held = state.copy()
+        self.conveyors.advance(held, path.grip_at)
+        offset = motion.inverse(path.pose_at(path.grip_at)) @ held.poses[part]
+        self.hold(held, part, offset)
+        held.joints = tuple(q_grip)
+        self.sync(held)
+        self.checker.set_joints(held.joints)
+        held.next_allowed = {(part, obj)
+                             for obj in self.checker.touching(part, CONTACT_DISTANCE)}
+        check2 = new_report('', 'move')
+        result2 = PathCheck()
+        if check1.collision_at < 0.0:
+            result2 = self._check_motion(
+                held, [timeline.time_at(u) - path.grip_at for u in second],
+                lambda t: cartesian.interpolate(samples, (t + path.grip_at) / path.duration),
+                lambda t: (t + path.grip_at) / path.duration, (), after)
+            check2 = after
+        report.allowed_contacts = sorted(set(before.allowed_contacts)
+                                         | set(check2.allowed_contacts))
+        failed = before if check1.collision_at >= 0.0 else (
+            check2 if result2.collision_at >= 0.0 else None)
+        clear = [r for r in (before, check2) if r.min_clearance >= 0.0]
+        closest = min(clear, key=lambda r: r.min_clearance) if clear else before
+        report.min_clearance = closest.min_clearance
+        report.closest_link, report.closest_object = closest.closest_link, closest.closest_object
+        check = PathCheck(tcp_path=check1.tcp_path + result2.tcp_path,
+                          collision_at=max(check1.collision_at, result2.collision_at))
+        if failed is not None:
+            report.status = StepReport.FAILED
+            report.collisions, report.collision_at = failed.collisions, failed.collision_at
+            report.message = 'collision at {:.0f}% of the pick: {}'.format(
+                100 * failed.collision_at, ', '.join(failed.collisions))
+        else:
+            message = (f'picked {part} on the move: in step after {path.sync_time:.2f} s, '
+                       f'gripped at {path.grip_at:.2f} s')
+            if skipped:
+                message += f' ({", ".join(skipped)} too far to catch)'
+            check.min_clearance = report.min_clearance
+            check.closest_body, check.closest_object = report.closest_link, report.closest_object
+            self._clearance_status(check, report, message)
+            if notes:
+                report.status = max(report.status, StepReport.WARNING)
+                report.message = '; '.join([report.message] + notes)
+        return PickPlan(part, tuple(state.joints), tuple(float(v) for v in samples[-1][1]),
+                        timeline, check, path, samples, self.arm, path.grip_at, offset)
+
+    def _catch(self, state, model, part, grasp, approach, lift, speed, grip_time):
+        """Plan the TCP motion and joints that catch part; raise StepError if they cannot."""
+        frame = self.definition(part, state.parts).frame('grasp')
+        if frame is None:
+            raise StepError(f'{part} has no grasp frame')
+        try:
+            path = tracking.TrackingMotion(
+                self.arm.fk(state.joints), state.poses[part], model.velocity,
+                motion.transform(frame.xyz, frame.rpy) @ grasp, approach, lift, self.tcp_limits,
+                speed, grip_time)
+        except ValueError as exc:
+            raise StepError(str(exc)) from None
+        timeline = tracking.Timeline(path.duration)
+        if part not in self.conveyors.predict(state, [path.grip_at])[0][0]:
+            raise StepError(f'{part} leaves the conveyor before it can be gripped '
+                            f'(at {path.grip_at:.2f} s)')
+        try:
+            samples = cartesian.follow(self.arm, path, state.joints, self.lower, self.upper,
+                                       self.check_step)
+        except cartesian.PathError as exc:
+            raise StepError(f'{part}: ' + str(exc).replace('of the path', 'of the pick')) \
+                from None
+        _, _, velocities = cartesian.trajectory(self.arm, path, timeline, samples, 0.02)
+        ratios = np.max(np.abs(velocities), axis=0) / np.asarray(self.max_velocity)
+        if ratios.max() > 1.0:
+            raise StepError(f'j{int(np.argmax(ratios)) + 1} would have to turn at '
+                            f'{100 * ratios.max():.0f}% of its speed limit to follow {part}')
+        return path, timeline, samples
+
+    def hold(self, state, part, offset):
+        """Take a part from where it is into the gripper (offset: its pose relative to the TCP)."""
+        state.poses.pop(part, None)
+        self.conveyors.take(state, part)
+        state.held[part] = np.asarray(offset)
+
+    def complete_pick(self, state, plan):
+        """Record a checked pick on the move in a check state (virtual time)."""
+        self.advance(state, plan.grip_at)
+        self.hold(state, plan.part, plan.offset)
+        self.advance(state, plan.path.duration - plan.grip_at)
+        self.complete_move(state, plan.goal)
+
     def plan_move(self, state, target, speed, allowed_contacts, report):
         """
         Check the PTP move from the joints of state to target; fill the report.
@@ -306,7 +604,7 @@ class RobotCell:
         self.conveyors.take(state, name)
         self.sync(state)
         self.checker.set_joints(state.joints)
-        support = self.checker.touching(name)
+        support = self.checker.touching(name, CONTACT_DISTANCE)
         state.next_allowed = {(name, obj) for obj in support}
         report.held_object = name
         report.message = f'gripped {name}, TCP {distance * 1000:.1f} mm from {name}/grasp'
@@ -366,6 +664,10 @@ class RobotCell:
                     moved[name] = previous[name] = pose
             samples.append((at(t), joints_at(t), moved))
         check = self.checker.check_motion(samples, allowed)
+        if check.collision_at < 0.0 and 0.0 <= check.min_clearance < CONTACT_DISTANCE:
+            # touching, as when a part is set down exactly on a surface: a contact to allow
+            check.collision_at = check.clearance_at
+            check.collisions = [f'{check.closest_body} <-> {check.closest_object}']
         report.min_clearance = check.min_clearance
         report.closest_link, report.closest_object = check.closest_body, check.closest_object
         report.collisions, report.collision_at = check.collisions, check.collision_at

@@ -90,3 +90,41 @@ def test_two_conveyors_share_the_part_numbers():
     assert conveyors.time_until(state, 'b/part_ready', True, 10.0) == (pytest.approx(2.0), False)
     conveyors.advance(state, 1.5)
     assert state.io == {'a/part_ready': True, 'b/part_ready': False}
+
+
+def continuous_line(speed=0.5, spacing=0.4, count=3):
+    """Return conveyors with a continuous belt: sensor at x=0.5, exit at x=1.0."""
+    spec = Conveyor(part='box', entry='in', station='eye', speed=speed, spacing=spacing,
+                    count=count, mode='continuous', exit_frame='out')
+    model = ConveyorModel('belt', spec, transform((0.0, 0.0, 0.8)), transform((0.5, 0.0, 0.8)),
+                          transform((1.0, 0.0, 0.8)))
+    conveyors = Conveyors({'belt': model})
+    state = CellState(joints=(0.0,) * 6, poses={})
+    conveyors.start(state)
+    return conveyors, model, state
+
+
+def test_a_continuous_belt_keeps_running_and_loses_unpicked_parts():
+    conveyors, model, state = continuous_line()
+    assert state.io[READY] is False
+    assert conveyors.time_until(state, READY, True, 60.0) == (pytest.approx(1.0), False)
+    conveyors.advance(state, 1.0)                 # box_1 reaches the sensor
+    assert state.io[READY] is True and distances(state) == {'box_1': 0.5, 'box_2': 0.1}
+    conveyors.advance(state, 1.0)                 # box_1 reaches the exit and leaves
+    assert distances(state) == {'box_2': 0.6, 'box_3': 0.2}
+    assert conveyors.missed(state) == ['box_1'] and 'box_1' not in state.poses
+    assert model.ready_part(state.belts['belt']) == 'box_2'
+    state.poses.pop('box_2')
+    conveyors.take(state, 'box_2')               # picked on the move
+    assert state.io[READY] is False and conveyors.moving(state)
+    assert conveyors.time_until(state, READY, True, 60.0) == (pytest.approx(0.6), False)
+    conveyors.advance(state, 10.0)
+    assert conveyors.missed(state) == ['box_1', 'box_3'] and not conveyors.moving(state)
+    assert conveyors.time_until(state, READY, True, 60.0) == (None, True)
+
+
+def test_parts_on_a_continuous_belt_move_at_the_belt_velocity():
+    conveyors, model, state = continuous_line(count=1)
+    frames, _ = conveyors.predict(state, [0.0, 0.5, 1.0])
+    assert [frame['box_1'][0, 3] for frame in frames] == pytest.approx([0.0, 0.25, 0.5])
+    assert model.velocity == pytest.approx([0.5, 0.0, 0.0])

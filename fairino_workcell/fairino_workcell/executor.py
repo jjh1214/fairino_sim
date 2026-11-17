@@ -17,6 +17,7 @@ conveyors wait for the next run; outside runs they run freely.
 
 Interfaces (fairino_workcell_msgs):
   action  /workcell/move          Move       check the path, then move (or only check)
+  action  /workcell/pick_moving   PickMoving pick a part on the move from a continuous conveyor
   service /workcell/gripper       Gripper    grip the object at the TCP, or release it
   service /workcell/wait          Wait       wait for a time or for an IO value
   service /workcell/set_io        SetIO      set a virtual IO
@@ -47,7 +48,7 @@ from fairino_workcell.robot_cell import (DEFAULT_SPEED, HELD_TOUCH_LINKS, JOINTS
                                          RobotCell, StepError)
 from fairino_workcell.scene import (collision_object, frame_transforms, gazebo_sdf,
                                     object_color, object_markers, pose_msg, transform_msg)
-from fairino_workcell_msgs.action import Move
+from fairino_workcell_msgs.action import Move, PickMoving
 from fairino_workcell_msgs.msg import IOState, StepReport
 from fairino_workcell_msgs.srv import Gripper, SetIO, Wait
 from geometry_msgs.msg import Point
@@ -91,6 +92,8 @@ class WorkcellExecutor(Node):
             'clearance_warning': float(p('clearance_warning', 0.01).value),
             'grasp_tolerance': float(p('grasp_tolerance', 0.01).value),
             'check_step': math.radians(float(p('check_step_deg', 0.5).value)),
+            'tcp_speed': float(p('max_tcp_speed', 1.0).value),
+            'tcp_acceleration': float(p('max_tcp_acceleration', 2.0).value),
         }
         self.execution_tolerance = float(p('execution_tolerance', 0.02).value)
         self.gazebo_world = p('gazebo_world', 'empty').value
@@ -136,6 +139,8 @@ class WorkcellExecutor(Node):
         self.display_pub = self.create_publisher(DisplayTrajectory, '/display_planned_path', 5)
         ActionServer(self, Move, '/workcell/move', self._on_move, callback_group=group,
                      cancel_callback=lambda _: CancelResponse.ACCEPT)
+        ActionServer(self, PickMoving, '/workcell/pick_moving', self._on_pick_moving,
+                     callback_group=group, cancel_callback=lambda _: CancelResponse.ACCEPT)
         self.create_service(Gripper, '/workcell/gripper', self._on_gripper, callback_group=group)
         self.create_service(Wait, '/workcell/wait', self._on_wait, callback_group=group)
         self.create_service(SetIO, '/workcell/set_io', self._on_set_io, callback_group=group)
@@ -238,10 +243,13 @@ class WorkcellExecutor(Node):
             with self.changed:
                 dt = 0.0 if self.last_tick is None else max(0.0, now - self.last_tick)
                 self.last_tick = now
-                new = []
+                new, gone = [], []
                 step = min(dt, self.budget)
                 if self.ready and step > 0.0:
+                    before = set(self.run_state.poses)
                     new = self.core.advance(self.run_state, step)
+                    gone = [name for name in before if name not in self.run_state.poses
+                            and name not in self.run_state.held]
                     self.budget -= step
                     self.changed.notify_all()
                 state = self.run_state
@@ -253,6 +261,8 @@ class WorkcellExecutor(Node):
                 parts, io = dict(state.parts), dict(state.io)
             if new:
                 self._show_parts(new)
+            if gone:
+                self._hide_parts(gone)
             self._publish_objects(poses, held, parts)
             if io != self.io_sent:
                 self.io_pub.publish(IOState(names=list(io), values=list(io.values())))
@@ -295,7 +305,7 @@ class WorkcellExecutor(Node):
             items = [(name, replace(self.core.definition(name, state.parts),
                                     pose=_matrix_pose(state.poses[name])), state.poses[name])
                      for name in names if name in state.poses]
-            all_parts = [self.core.definition(name, state.parts) for name in state.parts]
+            all_parts = self._present_parts()
         if items:
             scene = PlanningScene(is_diff=True)
             scene.robot_state.is_diff = True
@@ -323,7 +333,15 @@ class WorkcellExecutor(Node):
                     CollisionObject(id=name, operation=CollisionObject.REMOVE))
         if scene.world.collision_objects:
             self._call(self.scene_client, ApplyPlanningScene.Request(scene=scene), 10.0)
-        self.part_marker_pub.publish(object_markers([], 'parts'))
+        with self.changed:
+            present = self._present_parts()
+        self.part_marker_pub.publish(object_markers(present, 'parts'))
+
+    def _present_parts(self):
+        """Return the definitions of the parts in the cell (on a belt, put down or held)."""
+        state = self.run_state
+        return [self.core.definition(name, state.parts) for name in state.parts
+                if name in state.poses or name in state.held]
 
     # ------------------------------------------------------------------ sessions
     def _step_state(self, check_only, snapshot=False):
@@ -407,9 +425,10 @@ class WorkcellExecutor(Node):
         with self.lock:
             self.step_count += 1
             report = new_report(goal.name or 'move', 'move', goal.check_only)
-            state = None
+            state, missed = None, []
             try:
                 state = self._step_state(goal.check_only, snapshot=True)
+                missed = list(self.core.conveyors.missed(state))
                 report.start_time, report.start_joints = state.time, list(state.joints)
                 self._move(goal, state, report, goal_handle)
             except StepError as exc:
@@ -422,7 +441,7 @@ class WorkcellExecutor(Node):
                     self._end_step()
             if state is not None:
                 report.end_joints = list(self._state_of(goal.check_only).joints)
-            self._finish(report)
+            self._finish(report, missed)
         result = Move.Result(success=report.status != StepReport.FAILED, report=report)
         if goal_handle.is_cancel_requested:
             goal_handle.canceled()
@@ -436,18 +455,8 @@ class WorkcellExecutor(Node):
         return self.check_state if check_only else self.run_state
 
     def _move(self, goal, state, report, goal_handle):
-        goal_handle.publish_feedback(Move.Feedback(phase='target'))
-        if goal.target_type == Move.Goal.JOINTS:
-            target = tuple(float(v) for v in goal.joints)
-        elif goal.target_type == Move.Goal.POSE:
-            p, o = goal.pose.pose.position, goal.pose.pose.orientation
-            target = self.core.pose_target(state, goal.pose.header.frame_id, motion.pose_matrix(
-                (p.x, p.y, p.z), (o.x, o.y, o.z, o.w)))
-        else:
-            raise StepError(f'unknown target_type {goal.target_type}')
         goal_handle.publish_feedback(Move.Feedback(phase='check'))
-        plan = self.core.plan_move(state, target, goal.speed or self.default_speed,
-                                   goal.allowed_contacts, report)
+        plan = self.core.plan_goal(state, goal, self.default_speed, report)
         self._add_path_marker(report, plan.check)
         if report.status == StepReport.FAILED:
             return
@@ -467,19 +476,28 @@ class WorkcellExecutor(Node):
             self.core.complete_move(self.run_state, end)
 
     def _execute(self, plan, goal_handle):
-        times, positions, velocities, accelerations = motion.sample_ptp(
-            plan.start, plan.goal, plan.profile, 0.02)
+        sent = self._send_trajectory(plan)
+        if sent is not None:
+            self._wait_trajectory(*sent, goal_handle)
+
+    def _send_trajectory(self, plan):
+        """Send the trajectory of a plan to the controller; return what to wait for, or None."""
+        times, positions, velocities, accelerations = plan.trajectory(0.02)
         trajectory = JointTrajectory(joint_names=JOINTS)
-        for t, q, v, a in list(zip(times, positions, velocities, accelerations))[1:]:
-            trajectory.points.append(JointTrajectoryPoint(
-                positions=list(q), velocities=list(v), accelerations=list(a),
-                time_from_start=Duration(sec=int(t), nanosec=int((t % 1) * 1e9))))
+        for index in range(1, len(times)):
+            t = float(times[index])
+            point = JointTrajectoryPoint(
+                positions=list(positions[index]), velocities=list(velocities[index]),
+                time_from_start=Duration(sec=int(t), nanosec=int((t % 1) * 1e9)))
+            if accelerations is not None:
+                point.accelerations = list(accelerations[index])
+            trajectory.points.append(point)
         display = DisplayTrajectory(model_id=self.cell.robot.model)
         display.trajectory_start.joint_state = JointState(name=JOINTS, position=list(plan.start))
         display.trajectory.append(RobotTrajectory(joint_trajectory=trajectory))
         self.display_pub.publish(display)
         if not trajectory.points:
-            return
+            return None
         if not self.trajectory_client.wait_for_server(timeout_sec=10.0):
             raise StepError(f'controller {self.controller} is not available')
         send = self.trajectory_client.send_goal_async(
@@ -487,8 +505,9 @@ class WorkcellExecutor(Node):
         handle = self._wait(send, 10.0)
         if handle is None or not handle.accepted:
             raise StepError('the trajectory was rejected by the controller')
-        result_future = handle.get_result_async()
-        deadline = time.monotonic() + plan.profile.duration + 15.0
+        return handle, handle.get_result_async(), time.monotonic() + plan.profile.duration + 15.0
+
+    def _wait_trajectory(self, handle, result_future, deadline, goal_handle):
         while not result_future.done():
             if goal_handle.is_cancel_requested:
                 handle.cancel_goal_async()
@@ -498,6 +517,70 @@ class WorkcellExecutor(Node):
             time.sleep(0.02)
         if result_future.result().result.error_code != 0:
             raise StepError('controller error: ' + result_future.result().result.error_string)
+
+    def _on_pick_moving(self, goal_handle):
+        goal = goal_handle.request
+        with self.lock:
+            self.step_count += 1
+            report = new_report(goal.name or 'pick on the move', 'pick', goal.check_only)
+            state, missed = None, []
+            try:
+                state = self._step_state(goal.check_only, snapshot=True)
+                missed = list(self.core.conveyors.missed(state))
+                report.start_time, report.start_joints = state.time, list(state.joints)
+                goal_handle.publish_feedback(PickMoving.Feedback(phase='check'))
+                plan = self.core.plan_pick_goal(state, goal, self.default_speed, report)
+                self._add_path_marker(report, plan.check)
+                if report.status != StepReport.FAILED:
+                    if goal.check_only:
+                        self.core.complete_pick(state, plan)
+                    else:
+                        goal_handle.publish_feedback(PickMoving.Feedback(phase='execute'))
+                        self._execute_pick(plan, goal_handle, report)
+            except StepError as exc:
+                report.status, report.message = StepReport.FAILED, str(exc)
+            except Exception as exc:  # report internal errors instead of dropping the goal
+                self.get_logger().error(traceback.format_exc())
+                report.status, report.message = StepReport.FAILED, f'internal error: {exc}'
+            finally:
+                if not goal.check_only:
+                    self._end_step()
+            if state is not None:
+                report.end_joints = list(self._state_of(goal.check_only).joints)
+            self._finish(report, missed)
+        result = PickMoving.Result(success=report.status != StepReport.FAILED, report=report)
+        if goal_handle.is_cancel_requested:
+            goal_handle.canceled()
+        elif result.success:
+            goal_handle.succeed()
+        else:
+            goal_handle.abort()
+        return result
+
+    def _execute_pick(self, plan, goal_handle, report):
+        """Run a pick on the move: the gripper closes at the planned cell time."""
+        sent = self._send_trajectory(plan)
+        with self.changed:
+            start = self.run_state.time
+            self.budget = plan.grip_at       # the belt runs exactly up to the grip
+            while self.run_state.time < start + plan.grip_at - 1e-9:
+                if goal_handle.is_cancel_requested:
+                    if sent is not None:
+                        sent[0].cancel_goal_async()
+                    raise StepError('cancelled')
+                self.changed.wait(0.1)
+            self.core.hold(self.run_state, plan.part, plan.offset)
+        self._move_group_attach(plan.part, attach=True)
+        self._grant(plan.path.duration - plan.grip_at)
+        if sent is not None:
+            self._wait_trajectory(*sent, goal_handle)
+        end = self.current_joints()
+        error = float(np.max(np.abs(np.asarray(end) - np.asarray(plan.goal))))
+        if error > self.execution_tolerance:
+            report.status = max(report.status, StepReport.WARNING)
+            report.message += f'; tracking error {math.degrees(error):.1f} deg'
+        with self.changed:
+            self.core.complete_move(self.run_state, end)
 
     def _wait(self, future, timeout):
         done = threading.Event()
@@ -510,8 +593,10 @@ class WorkcellExecutor(Node):
         with self.lock:
             self.step_count += 1
             report = new_report(request.name or kind, kind, request.check_only)
+            missed = None
             try:
                 state = self._step_state(request.check_only)
+                missed = list(self.core.conveyors.missed(state))
                 with self.changed:
                     report.start_time = state.time
                     report.start_joints = report.end_joints = list(state.joints)
@@ -525,7 +610,7 @@ class WorkcellExecutor(Node):
                     else:
                         name, pose = result
                         self._move_group_attach(name, attach=False)
-                        self.scene_poses[name] = pose
+                        self.scene_poses[name] = None   # send the release pose to MoveIt
                         if self.gazebo is not None and name in self.gz_poses:
                             self.gazebo.set_pose(name, pose)
                             self.gz_poses[name] = pose
@@ -537,13 +622,20 @@ class WorkcellExecutor(Node):
             finally:
                 if not request.check_only:
                     self._end_step()
-            self._finish(report)
+            self._finish(report, missed)
         response.success = report.status != StepReport.FAILED
         response.report = report
         return response
 
     def _move_group_attach(self, name, attach):
+        """Attach an object to the TCP in the MoveIt scene, where the executor holds it."""
         attached = AttachedCollisionObject(link_name='tcp', touch_links=HELD_TOUCH_LINKS)
+        offset = self.run_state.held.get(name) if attach else None
+        if offset is not None:
+            # give the shape and the pose: MoveIt's own robot state lags behind a fast robot
+            attached.object = collision_object(self.core.definition(name, self.run_state.parts))
+            attached.object.header.frame_id = 'tcp'
+            attached.object.pose = pose_msg(_matrix_pose(offset))
         attached.object.id = name
         attached.object.operation = attached.object.ADD if attach else attached.object.REMOVE
         scene = PlanningScene(is_diff=True)
@@ -558,9 +650,10 @@ class WorkcellExecutor(Node):
         report = new_report(request.name or 'wait', 'wait', request.check_only)
         with self.lock:
             self.step_count += 1
-            state = None
+            state, missed = None, None
             try:
                 state = self._step_state(request.check_only, snapshot=True)
+                missed = list(self.core.conveyors.missed(state))
                 report.start_time = state.time
                 report.start_joints = report.end_joints = list(state.joints)
                 plan = self.core.plan_wait(state, report, request.io, request.value,
@@ -581,7 +674,7 @@ class WorkcellExecutor(Node):
             finally:
                 if not request.check_only:
                     self._end_step()
-            self._finish(report)
+            self._finish(report, missed)
         response.success = report.status != StepReport.FAILED
         response.report = report
         return response
@@ -626,10 +719,13 @@ class WorkcellExecutor(Node):
         return response
 
     # ------------------------------------------------------------------ reports
-    def _finish(self, report):
+    def _finish(self, report, missed_before=None):
         state = self._state_of(report.check_only)
         if state is not None:
             report.held_object = next(iter(state.held), '')
+            if missed_before is not None:
+                report.missed_parts = [part for part in self.core.conveyors.missed(state)
+                                       if part not in missed_before]
         self.report_pub.publish(report)
         text = f"{'[check] ' if report.check_only else ''}{report.name}: {report.message}"
         # rclpy needs one severity per logging call site
