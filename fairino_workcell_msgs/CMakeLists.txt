@@ -12,6 +12,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/SetIO.srv"
   "srv/Wait.srv"
   "action/Move.action"
+  "action/PickMoving.action"
   DEPENDENCIES geometry_msgs
 )
 

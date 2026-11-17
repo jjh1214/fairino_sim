@@ -21,3 +21,4 @@ string[] allowed_contacts  # contacts that were allowed for this step, as "body 
 float64[] start_joints # rad
 float64[] end_joints   # rad
 string held_object     # object held by the gripper after this step, empty if none
+string[] missed_parts  # parts that left a continuous conveyor unpicked during this step

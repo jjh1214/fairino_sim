@@ -1,0 +1,17 @@
+# Pick a part on the move from a continuous conveyor (conveyor tracking), checked as a whole:
+# the TCP comes in step with the moving part above it, goes down to it while following it,
+# follows it while the gripper closes, lifts it while still following the belt, then stops.
+string conveyor                    # name of the conveyor object
+string part                        # empty: the first part that has passed the conveyor sensor
+geometry_msgs/Pose grasp           # TCP pose relative to the part's grasp frame when gripping
+float64 approach                   # m above the grasp pose where the TCP is in step with the part
+float64 lift                       # m to lift the part, still following the belt
+float64 grip_time                  # s for the gripper to close, following the part
+float64 speed                      # fraction of the TCP speed limits (0..1]; 0 = default
+bool check_only                    # check in the check session only; do not move the robot
+string name                        # step name for the report
+---
+bool success
+StepReport report
+---
+string phase                       # check or execute
