@@ -1,6 +1,8 @@
 # Close (grip) or open (release) the gripper.
-# Grip attaches the graspable object whose 'grasp' frame is nearest to the TCP (within the
-# grasp tolerance); release leaves the held object where it is.
+# Grip: fingers close until they touch the object between them (the graspable object whose
+# 'grasp' frame is nearest to the TCP) and centre it; a tool without fingers attaches the object
+# whose grasp frame is within the grasp tolerance. Release leaves the held object where it is
+# and opens the fingers fully. Both take the time the fingers need (report.duration).
 bool close
 bool check_only   # apply to the check session only; the simulation is not changed
 string name       # step name for the report

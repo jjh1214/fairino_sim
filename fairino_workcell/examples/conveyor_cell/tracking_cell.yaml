@@ -44,6 +44,11 @@ objects:
       speed: 0.06                           # m/s
       spacing: 0.90                         # m between parts on the belt
       count: 4
+      placement_error:                      # parts lie anywhere within these ranges on the belt
+        across: 0.03                        # +/- m across the belt
+        along: 0.03                         # +/- m along the belt (they pass the sensor earlier or later)
+        yaw_deg: 25                         # +/- degrees about the vertical
+        seed: 7                             # the same parts in every run; change for others
 
   - name: table
     visual: meshes/table/visual.glb

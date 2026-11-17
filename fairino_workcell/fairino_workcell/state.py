@@ -16,9 +16,10 @@ class CellState:
     belts: dict = field(default_factory=dict)        # conveyor -> conveyor.Belt
     parts: dict = field(default_factory=dict)        # part put in by a conveyor -> part type
     counters: dict = field(default_factory=dict)     # part type -> parts put in so far
+    fingers: float = None                            # gripper finger position [m], None: none
 
     def copy(self):
         return CellState(tuple(self.joints), {k: v.copy() for k, v in self.poses.items()},
                          {k: v.copy() for k, v in self.held.items()}, set(self.next_allowed),
                          self.time, dict(self.io), {k: b.copy() for k, b in self.belts.items()},
-                         dict(self.parts), dict(self.counters))
+                         dict(self.parts), dict(self.counters), self.fingers)

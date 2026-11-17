@@ -6,8 +6,9 @@ A recipe is a Python function that receives a Workcell::
     def recipe(cell):
         cell.move_joints([-45, -90, -90, -90, 90, 0], name='home')        # degrees
         cell.wait_io('conveyor/part_ready')                               # a part at the station
-        cell.move_to('conveyor/station', xyz=(0, 0, 0.03), allow_contact=['part'], name='pick')
+        cell.move_to('conveyor/part/grasp', name='pick')                  # wherever it lies
         cell.grip()
+        cell.move_line('tcp', xyz=(0, 0, -0.1), name='lift')              # 10 cm up the tool axis
 
 Run it in the simulation, or with --check to validate every step without moving the robot::
 
@@ -43,6 +44,14 @@ from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from std_srvs.srv import Trigger
 
 STATUS = {StepReport.OK: 'OK', StepReport.WARNING: 'WARNING', StepReport.FAILED: 'FAILED'}
+DOWN = (180.0, 0.0, 0.0)          # default orientation: the tool points down onto the frame
+
+
+def _rpy(frame, rpy_deg):
+    """Return the orientation of a target: by default down onto a frame, unchanged on 'tcp'."""
+    if rpy_deg is not None:
+        return rpy_deg
+    return (0.0, 0.0, 0.0) if frame == 'tcp' else DOWN
 
 
 def _pose_stamped(frame, xyz, rpy_deg):
@@ -129,65 +138,78 @@ class Workcell:
         goal = Move.Goal(target_type=Move.Goal.JOINTS, joints=values)
         return self._run_move(goal, speed, name, allow_contact)
 
-    def move_to(self, frame, xyz=(0.0, 0.0, 0.0), rpy_deg=(180.0, 0.0, 0.0), speed=None,
-                name=None, allow_contact=()):
+    def move_to(self, frame, xyz=(0.0, 0.0, 0.0), rpy_deg=None, speed=None, name=None,
+                allow_contact=()):
         """
-        Move the TCP to a pose given in a cell frame, such as 'part/grasp'.
+        Move the TCP to a pose given in a cell frame, with a PTP motion.
 
-        The default orientation points the tool down onto the frame (180 degrees about x).
+        Frames are 'world', objects and parts, 'object/frame' such as 'table/place',
+        'conveyor/part' (the part a conveyor has ready, wherever it lies) with its frames such
+        as 'conveyor/part/grasp', and 'tcp' (the TCP where the move starts, for moves in the
+        tool frame: its z axis points out of the tool). The default orientation points the tool
+        down onto the frame (180 degrees about x), and keeps it on 'tcp'.
         """
-        return self.move_pose(_pose_stamped(frame, xyz, rpy_deg), speed, name or f'to {frame}',
-                              allow_contact)
+        return self.move_pose(_pose_stamped(frame, xyz, _rpy(frame, rpy_deg)), speed,
+                              name or f'to {frame}', allow_contact)
 
     def move_pose(self, pose, speed=None, name=None, allow_contact=(), motion=Move.Goal.PTP):
         """Move the TCP to a geometry_msgs/PoseStamped (frame: world or a cell frame)."""
         goal = Move.Goal(target_type=Move.Goal.POSE, pose=pose, motion=motion)
         return self._run_move(goal, speed, name, allow_contact)
 
-    def move_line(self, frame, xyz=(0.0, 0.0, 0.0), rpy_deg=(180.0, 0.0, 0.0), speed=None,
-                  name=None, allow_contact=()):
+    def move_line(self, frame, xyz=(0.0, 0.0, 0.0), rpy_deg=None, speed=None, name=None,
+                  allow_contact=()):
         """
         Move the TCP in a straight line (like MoveL) to a pose given in a cell frame.
 
-        speed is a fraction of the TCP speed limits. The orientation turns uniformly on the
-        way; the move fails where the arm would pass a singularity or leave a joint limit.
+        Frames and the default orientation are as for move_to; move_line('tcp', xyz=(0, 0,
+        -0.1)) moves the tool 10 cm back along its axis. speed is a fraction of the TCP speed
+        limits. The orientation turns uniformly on the way; the move fails where the arm would
+        pass a singularity or leave a joint limit.
         """
         goal = Move.Goal(target_type=Move.Goal.POSE, motion=Move.Goal.LIN,
-                         pose=_pose_stamped(frame, xyz, rpy_deg))
+                         pose=_pose_stamped(frame, xyz, _rpy(frame, rpy_deg)))
         return self._run_move(goal, speed, name or f'line to {frame}', allow_contact)
 
-    def move_arc(self, frame, via, xyz, rpy_deg=(180.0, 0.0, 0.0), speed=None, name=None,
-                 allow_contact=()):
+    def move_arc(self, frame, via, xyz, rpy_deg=None, speed=None, name=None, allow_contact=()):
         """Move the TCP along the arc through via to xyz, both in frame (like MoveC)."""
         goal = Move.Goal(target_type=Move.Goal.POSE, motion=Move.Goal.CIRC,
-                         pose=_pose_stamped(frame, xyz, rpy_deg),
+                         pose=_pose_stamped(frame, xyz, _rpy(frame, rpy_deg)),
                          via=_pose_stamped(frame, via, (0.0, 0.0, 0.0)))
         return self._run_move(goal, speed, name or f'arc to {frame}', allow_contact)
 
-    def pick_moving(self, conveyor, approach=0.1, lift=0.1, rpy_deg=(180.0, 0.0, 0.0),
-                    speed=None, grip_time=0.3, part='', name=None):
+    def pick_moving(self, conveyor, approach=0.1, lift=0.1, rpy_deg=DOWN, speed=None,
+                    grip_time=None, part='', name=None):
         """
         Pick a part on the move from a continuous conveyor (conveyor tracking).
 
         One checked motion: the TCP comes in step with the part approach metres above its
-        grasp pose (rpy_deg relative to the part's grasp frame), goes down to it while
-        following it, follows it for grip_time while the gripper closes, lifts it lift metres
-        while still following the belt, and stops. The part is the first one past the
-        conveyor sensor unless part is given; afterwards it is in the gripper.
+        grasp pose (rpy_deg relative to the part's grasp frame, so it turns with the part),
+        goes down to it while following it, follows it while the gripper closes (grip_time
+        seconds; by default as long as the fingers need), lifts it lift metres while still
+        following the belt, and stops. The part is the first one past the conveyor sensor
+        unless part is given; afterwards it is in the gripper.
         """
         goal = PickMoving.Goal(conveyor=conveyor, part=part, approach=float(approach),
-                               lift=float(lift), grip_time=float(grip_time),
+                               lift=float(lift),
+                               grip_time=-1.0 if grip_time is None else float(grip_time),
                                speed=float(speed or self.speed or 0.0),
                                check_only=self.check_only, name=name or f'pick from {conveyor}')
         goal.grasp = _pose_stamped('', (0.0, 0.0, 0.0), rpy_deg).pose
         return self._record(self._send_pick_moving(goal))
 
     def grip(self, name=None):
-        """Close the gripper on the object whose grasp frame is at the TCP."""
+        """
+        Close the gripper on the object at the TCP.
+
+        Fingers close until they touch the object between them (the one whose grasp frame is
+        nearest to the TCP) and centre it; a tool without fingers takes the object whose grasp
+        frame is within the grasp tolerance of the TCP.
+        """
         return self._gripper_step(True, name or 'grip')
 
     def release(self, name=None):
-        """Open the gripper and leave the held object where it is."""
+        """Open the gripper (fully) and leave the held object where it is."""
         return self._gripper_step(False, name or 'release')
 
     def set_io(self, io, value, name=None):

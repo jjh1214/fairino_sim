@@ -14,6 +14,9 @@ each question with its own allowed collision matrix (ACM):
 Colliding and closest pairs are named by repeating a check with one object or body enabled.
 Objects that move during a motion (parts on a running conveyor) are moved in the scene for every
 sample of the motion, and their clearance copies for the samples where clearance is computed.
+
+The fingers of a gripper are robot links on prismatic joints: their position is part of every
+robot state that is checked (a 7th value after the arm joints, or the checker's fingers).
 """
 
 from dataclasses import dataclass, field
@@ -51,9 +54,12 @@ class Checker:
 
     _world_owner = None     # the checker whose objects are in the shared collision world
 
-    def __init__(self, cell, urdf, srdf, group, tool_bodies):
+    def __init__(self, cell, urdf, srdf, group, tool_bodies, fingers=()):
+        """Load the robot model; fingers maps the finger links to their joints."""
         self.cell = cell
         self.group = group
+        self.finger_links = dict(fingers)     # finger link -> its prismatic joint
+        self.fingers = None                   # finger position when a state does not give one
         self._tmp = tempfile.mkdtemp(prefix='fairino_checker_')
         urdf_file, srdf_file = (os.path.join(self._tmp, n) for n in ('robot.urdf', 'robot.srdf'))
         with open(urdf_file, 'w') as stream:
@@ -196,8 +202,63 @@ class Checker:
 
     # ---------------------------------------------------------------- queries
     def set_joints(self, joints):
-        self.state.set_joint_group_positions(self.group, list(joints))
+        """Set the arm joints; a 7th value sets both fingers (else the checker's fingers)."""
+        joints = list(joints)
+        self.state.set_joint_group_positions(self.group, joints[:6])
+        fingers = joints[6] if len(joints) > 6 else self.fingers
+        if self.finger_links and fingers is not None:
+            self.state.joint_positions = {joint: float(fingers)
+                                          for joint in self.finger_links.values()}
         self.state.update()
+
+    def move_object(self, name, pose):
+        """Move a world object of the current scene (without its clearance copy)."""
+        self._place({name: pose}, copies=False)
+
+    def object_pose(self, name):
+        return self._world_poses[name].copy()
+
+    def finger_contact(self, name, start, step=0.001, iterations=30):
+        """
+        Return where each finger first touches the world object name when it closes.
+
+        The arm stays where it is (see set_joints). Each finger joint runs from start towards
+        -start, past the middle where the other finger would stop, so that a part lying to one
+        side is found as well. Return {finger link: joint position at the first contact}: start
+        if the finger touches already, None if it never does.
+        """
+        contacts = {}
+        for link, joint in self.finger_links.items():
+            acm = self._env_acm(set(), only_object=name, only_body=link)
+
+            def touches(value, joint=joint, acm=acm):
+                self.state.joint_positions = {joint: float(value)}
+                self.state.update()
+                return self._check(acm)[0]
+
+            if touches(start):
+                contacts[link] = start
+                continue
+            free, hit = start, None
+            while free > -start:
+                value = max(free - step, -start)
+                if touches(value):
+                    hit = value
+                    break
+                free = value
+            if hit is not None:
+                for _ in range(iterations):         # free side: no contact
+                    middle = 0.5 * (free + hit)
+                    if touches(middle):
+                        hit = middle
+                    else:
+                        free = middle
+            contacts[link] = None if hit is None else free
+        if self.fingers is not None:
+            self.state.joint_positions = {joint: float(self.fingers)
+                                          for joint in self.finger_links.values()}
+        self.state.update()
+        return contacts
 
     def link_pose(self, link):
         return np.array(self.state.get_global_link_transform(link))
@@ -278,7 +339,7 @@ class Checker:
         the objects whose pose changed. Stop at the first collision.
         """
         allowed_pairs = set(allowed_pairs)
-        result = PathCheck(end_joints=tuple(samples[-1][1]))
+        result = PathCheck(end_joints=tuple(samples[-1][1])[:6])
         initial = {name: pose.copy() for name, pose in self._world_poses.items()}
         moving = {}               # latest pose of every object that moved so far
 

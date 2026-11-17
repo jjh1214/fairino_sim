@@ -8,6 +8,11 @@ Example recipe: wait for the first part at the conveyor station and place it on 
 Pose targets of PTP moves are solved like on the robot controller: the joint solution nearest
 to the current joints. HOME (elbow up, tool down) therefore sets the arm configuration of the
 moves. The vertical moves to and from the part are straight lines (move_line, like MoveL).
+
+The parts do not lie exactly on the station: cell.yaml gives them a placement error across the
+belt and about the vertical. The pick goes to conveyor/part, the part the conveyor has ready,
+as a vision system would report it: the gripper turns with the part and its open fingers come
+down beside it, then close on it.
 """
 
 HOME = [-45, -90, -90, -90, 90, 0]   # joint angles in degrees, as on the teach pendant
@@ -23,12 +28,12 @@ def pick(cell, n=''):
     cell.move_to('conveyor/station', xyz=(0, 0, GRASP_HEIGHT + APPROACH), rpy_deg=AT_CONVEYOR,
                  name=f'{n}above station')
     cell.wait_io('conveyor/part_ready', name=f'{n}wait for part')
-    # the gripper fingers close around the part, so contact with parts is allowed
-    cell.move_line('conveyor/station', xyz=(0, 0, GRASP_HEIGHT), rpy_deg=AT_CONVEYOR, speed=0.1,
-                   allow_contact=['part'], name=f'{n}pick')
+    # where the part lies: above its grasp frame, turned like it, then straight down
+    cell.move_line('conveyor/part/grasp', xyz=(0, 0, APPROACH), rpy_deg=AT_CONVEYOR,
+                   name=f'{n}above part')
+    cell.move_line('conveyor/part/grasp', rpy_deg=AT_CONVEYOR, speed=0.1, name=f'{n}pick')
     cell.grip(name=f'{n}grip')
-    cell.move_line('conveyor/station', xyz=(0, 0, GRASP_HEIGHT + APPROACH), rpy_deg=AT_CONVEYOR,
-                   name=f'{n}lift')
+    cell.move_line('tcp', xyz=(0, 0, -APPROACH), name=f'{n}lift')    # straight up the tool axis
 
 
 def place(cell, x=0.0, y=0.0, n=''):

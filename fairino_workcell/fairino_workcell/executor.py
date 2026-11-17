@@ -1,7 +1,8 @@
 """
 Run and check recipe steps in the work cell, and run the conveyors that bring the parts.
 
-Steps are PTP moves, grip and release, waits and virtual IO.
+Steps are moves (PTP, LIN, CIRC), picks on the move, grip and release, waits and virtual IO.
+A gripper with fingers moves them with the gripper_controller of the simulation.
 
 Every step is checked before it runs (see fairino_workcell.robot_cell): the target must be
 reachable and within the joint limits, and the robot, the tool and the held object must not
@@ -44,8 +45,7 @@ from fairino_workcell import motion
 from fairino_workcell.cell import CellError, load_cell, Pose
 from fairino_workcell.gazebo import Gazebo
 from fairino_workcell.kinematics import KinematicsError
-from fairino_workcell.robot_cell import (DEFAULT_SPEED, HELD_TOUCH_LINKS, JOINTS, new_report,
-                                         RobotCell, StepError)
+from fairino_workcell.robot_cell import DEFAULT_SPEED, JOINTS, new_report, RobotCell, StepError
 from fairino_workcell.scene import (collision_object, frame_transforms, gazebo_sdf,
                                     object_color, object_markers, pose_msg, transform_msg)
 from fairino_workcell_msgs.action import Move, PickMoving
@@ -129,6 +129,9 @@ class WorkcellExecutor(Node):
         self.trajectory_client = ActionClient(
             self, FollowJointTrajectory, f'/{self.controller}/follow_joint_trajectory',
             callback_group=group)
+        self.gripper_client = ActionClient(
+            self, FollowJointTrajectory,
+            f'/{description.GRIPPER_CONTROLLER}/follow_joint_trajectory', callback_group=group)
         self.report_pub = self.create_publisher(StepReport, '/workcell/step_report', 10)
         self.io_pub = self.create_publisher(IOState, '/workcell/io', latched)
         self.tf_pub = self.create_publisher(TFMessage, '/tf', 20)
@@ -201,6 +204,7 @@ class WorkcellExecutor(Node):
             with self.changed:
                 parts = list(self.run_state.parts)
             self._show_parts(parts)
+            self._open_fingers()
 
     def _clear_cell_state(self):
         """Detach held objects and remove the parts from Gazebo, MoveIt and RViz."""
@@ -437,6 +441,7 @@ class WorkcellExecutor(Node):
                 self._clear_markers()
                 self.changed.notify_all()
             self._show_parts(parts)
+            self._open_fingers()
         response.success = True
         response.message = 'cell reset; the conveyors wait for the next run'
         return response
@@ -587,6 +592,10 @@ class WorkcellExecutor(Node):
         with self.changed:
             start = self.run_state.time
             self.budget = plan.grip_at       # the belt runs exactly up to the grip
+        if plan.fingers is not None:         # they stay open, then close while following
+            self._send_fingers([(plan.close_at, self.run_state.fingers),
+                                (plan.grip_at, plan.fingers)])
+        with self.changed:
             while self.run_state.time < start + plan.grip_at - 1e-9:
                 if goal_handle.is_cancel_requested:
                     if sent is not None:
@@ -594,6 +603,8 @@ class WorkcellExecutor(Node):
                     raise StepError('cancelled')
                 self.changed.wait(0.1)
             self.core.hold(self.run_state, plan.part, plan.offset)
+            if plan.fingers is not None:
+                self.run_state.fingers = plan.fingers
         self._move_group_attach(plan.part, attach=True)
         self._grant(plan.path.duration - plan.grip_at)
         if sent is not None:
@@ -621,25 +632,19 @@ class WorkcellExecutor(Node):
             report = new_report(request.name or kind, kind, request.check_only)
             missed = None
             try:
-                state = self._step_state(request.check_only)
+                state = self._step_state(request.check_only, snapshot=True)
                 missed = list(self.core.conveyors.missed(state))
+                report.start_time = state.time
+                report.start_joints = report.end_joints = list(state.joints)
                 with self.changed:
-                    report.start_time = state.time
-                    report.start_joints = report.end_joints = list(state.joints)
-                    if request.close:
-                        result = self.core.grip(state, report)
+                    plan = (self.core.plan_grip(state, report) if request.close
+                            else self.core.plan_release(state, report))
+                if plan is not None and report.status != StepReport.FAILED:
+                    if request.check_only:
+                        with self.changed:
+                            self._complete_gripper(state, request.close, plan, report)
                     else:
-                        result = self.core.release(state, report)
-                if result and not request.check_only:
-                    if request.close:
-                        self._move_group_attach(result, attach=True)
-                    else:
-                        name, pose = result
-                        self._move_group_attach(name, attach=False)
-                        self.scene_poses[name] = None   # send the release pose to MoveIt
-                        if self.gazebo is not None and name in self.gz_poses:
-                            self.gazebo.set_pose(name, pose)
-                            self.gz_poses[name] = pose
+                        self._execute_gripper(request.close, plan, report)
             except StepError as exc:
                 report.status, report.message = StepReport.FAILED, str(exc)
             except Exception as exc:  # report internal errors instead of failing the service
@@ -653,9 +658,80 @@ class WorkcellExecutor(Node):
         response.report = report
         return response
 
+    def _complete_gripper(self, state, close, plan, report):
+        """Record a checked grip or release in a check state (virtual time)."""
+        if close:
+            self.core.advance(state, plan.duration)
+            self.core.complete_grip(state, plan, report)
+        else:
+            self.core.complete_release(state, plan)
+            self.core.advance(state, plan.duration)
+
+    def _execute_gripper(self, close, plan, report):
+        """Grip: close the fingers, then hold the part. Release: let go, then open them."""
+        if close:
+            self._grant(plan.duration)          # the conveyors run while the fingers move
+            self._move_fingers(plan.fingers, plan.duration)
+            if self.in_run:
+                self._flush_budget()
+            with self.changed:
+                self.core.complete_grip(self.run_state, plan, report)
+            self._move_group_attach(plan.part, attach=True)
+            return
+        with self.changed:
+            self.core.complete_release(self.run_state, plan)
+        self._move_group_attach(plan.part, attach=False)
+        self.scene_poses[plan.part] = None       # send the release pose to MoveIt
+        if self.gazebo is not None and plan.part in self.gz_poses:
+            self.gazebo.set_pose(plan.part, plan.pose)
+            self.gz_poses[plan.part] = plan.pose
+        self._grant(plan.duration)
+        self._move_fingers(plan.fingers, plan.duration)
+        if self.in_run:
+            self._flush_budget()
+
+    def _move_fingers(self, target, duration):
+        """Move the fingers to target in the simulation within duration and wait for them."""
+        if target is None:
+            return
+        sent = self._send_fingers([(max(duration, 0.02), target)])
+        if sent is not None:
+            handle, result, _ = sent
+            deadline = time.monotonic() + duration + 15.0
+            while not result.done():
+                if time.monotonic() > deadline:
+                    raise StepError('the gripper did not finish moving')
+                time.sleep(0.02)
+
+    def _send_fingers(self, points):
+        """Send the fingers [(s from now, position)] to the gripper controller."""
+        if self.core.fingers is None:
+            return None
+        trajectory = JointTrajectory(joint_names=list(description.FINGER_JOINTS))
+        for t, position in points:
+            trajectory.points.append(JointTrajectoryPoint(
+                positions=[float(position)] * 2, velocities=[0.0, 0.0],
+                time_from_start=Duration(sec=int(t), nanosec=int((t % 1) * 1e9))))
+        if not self.gripper_client.wait_for_server(timeout_sec=10.0):
+            raise StepError(f'controller {description.GRIPPER_CONTROLLER} is not available')
+        handle = self._wait(self.gripper_client.send_goal_async(
+            FollowJointTrajectory.Goal(trajectory=trajectory)), 10.0)
+        if handle is None or not handle.accepted:
+            raise StepError('the gripper trajectory was rejected by the controller')
+        return handle, handle.get_result_async(), None
+
+    def _open_fingers(self):
+        """Open the fingers of the simulation (after a reset or reload), without waiting."""
+        try:
+            if self.core.fingers is not None:
+                self._send_fingers([(0.5, self.core.open_fingers)])
+        except StepError as exc:
+            self.get_logger().warning(f'cannot open the gripper: {exc}')
+
     def _move_group_attach(self, name, attach):
         """Attach an object to the TCP in the MoveIt scene, where the executor holds it."""
-        attached = AttachedCollisionObject(link_name='tcp', touch_links=HELD_TOUCH_LINKS)
+        attached = AttachedCollisionObject(link_name='tcp',
+                                           touch_links=self.core.held_touch_links)
         offset = self.run_state.held.get(name) if attach else None
         if offset is not None:
             # give the shape and the pose: MoveIt's own robot state lags behind a fast robot

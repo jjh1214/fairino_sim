@@ -21,7 +21,10 @@ ROBOT_KEYS = ('model', 'base', 'initial_positions', 'initial_positions_deg', 'to
 SHAPE_KEYS = ('name', 'visual', 'collision', 'units', 'box', 'cylinder', 'color', 'frames')
 OBJECT_KEYS = SHAPE_KEYS + ('pose', 'touch_links', 'movable', 'conveyor')
 PART_KEYS = SHAPE_KEYS
-CONVEYOR_KEYS = ('part', 'entry', 'station', 'exit', 'mode', 'speed', 'spacing', 'count')
+CONVEYOR_KEYS = ('part', 'entry', 'station', 'exit', 'mode', 'speed', 'spacing', 'count',
+                 'placement_error')
+PLACEMENT_KEYS = ('across', 'along', 'yaw_deg', 'seed')
+PART_FRAME = 'part'      # conveyor/part: the part a conveyor has ready (see robot_cell)
 CONVEYOR_MODES = ('index', 'continuous')
 VISUAL_FORMATS = ('.glb', '.gltf', '.dae', '.obj', '.stl')
 EMBEDDED_MATERIAL_FORMATS = ('.glb', '.gltf', '.dae')
@@ -57,6 +60,21 @@ class Geometry:
 
 
 @dataclass(frozen=True)
+class PlacementError:
+    """
+    How far from its nominal place each part lies on the belt, drawn at random per part.
+
+    The draws depend only on the seed and the part number, so a check and the run after it,
+    and every run after a reset, see the same parts in the same places.
+    """
+
+    across: float = 0.0    # m, up to this far left or right of the belt centre line
+    along: float = 0.0     # m, up to this far ahead of or behind its place in the row
+    yaw: float = 0.0       # rad, turned up to this much about the vertical
+    seed: int = 0
+
+
+@dataclass(frozen=True)
 class Conveyor:
     """
     A conveyor that brings parts, put on its belt at the entry frame.
@@ -74,6 +92,7 @@ class Conveyor:
     count: int = 0     # parts to put on the belt; 0: no limit
     mode: str = 'index'
     exit_frame: str = ''   # continuous: frame where parts leave the belt (key exit)
+    placement_error: PlacementError = None
 
 
 @dataclass(frozen=True)
@@ -353,9 +372,35 @@ def _conveyor(data, frames, part_types, where):
     count = data.get('count', 0)
     if isinstance(count, bool) or not isinstance(count, int) or count < 0:
         raise CellError(f'{where}: count must be a whole number, 0 for no limit')
+    if PART_FRAME in frames:
+        raise CellError(f"{where}: a conveyor cannot have a frame named '{PART_FRAME}' (in "
+                        f'recipes, <conveyor>/{PART_FRAME} is the part it has ready)')
+    placement = None
+    if 'placement_error' in data:
+        placement = _placement_error(data['placement_error'], where)
     return Conveyor(part=data['part'], entry=data['entry'], station=data['station'],
                     speed=values['speed'], spacing=values['spacing'], count=count, mode=mode,
-                    exit_frame=data.get('exit', ''))
+                    exit_frame=data.get('exit', ''), placement_error=placement)
+
+
+def _placement_error(data, where):
+    where = f'{where}: placement_error'
+    if not isinstance(data, dict):
+        raise CellError(f'{where} must be a mapping with across, along, yaw_deg and seed')
+    _check_keys(data, PLACEMENT_KEYS, where)
+    values = {}
+    for key in ('across', 'along', 'yaw_deg'):
+        try:
+            values[key] = float(data.get(key, 0.0))
+        except (TypeError, ValueError):
+            raise CellError(f'{where}: {key} must be a number') from None
+        if values[key] < 0.0:
+            raise CellError(f'{where}: {key} must not be negative (it is a +/- range)')
+    seed = data.get('seed', 0)
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise CellError(f'{where}: seed must be a whole number')
+    return PlacementError(across=values['across'], along=values['along'],
+                          yaw=math.radians(values['yaw_deg']), seed=seed)
 
 
 def _flag(value, what, where):

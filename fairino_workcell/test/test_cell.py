@@ -3,7 +3,7 @@
 import math
 import os
 
-from fairino_workcell.cell import CellError, Conveyor, load_cell
+from fairino_workcell.cell import CellError, Conveyor, load_cell, PlacementError
 import pytest
 
 EXAMPLE = os.path.join(os.path.dirname(__file__), '..', 'examples', 'conveyor_cell',
@@ -35,8 +35,9 @@ def test_example_cell():
     assert 'conveyor/station' in cell.frame_names()
     assert cell.objects[0].geometry.size == (0.3, 0.3, 0.75)
     assert cell.objects[0].touch_links == ('base_link', 'shoulder_link')
-    assert conveyor.conveyor == Conveyor(part='part', entry='entry', station='station',
-                                         speed=0.15, spacing=0.30, count=4)
+    assert conveyor.conveyor == Conveyor(
+        part='part', entry='entry', station='station', speed=0.15, spacing=0.30, count=4,
+        placement_error=PlacementError(across=0.03, yaw=math.radians(25), seed=7))
     part, = cell.parts
     assert part.name == 'part' and part.movable and part.frame('grasp').xyz == (0.0, 0.0, 0.03)
     assert not any(obj.movable for obj in cell.objects)
@@ -143,6 +144,13 @@ GOOD = 'part: box, entry: a, station: b, speed: 0.2, spacing: 0.3'
     (PARTS, BELT % (GOOD + ', count: true'), 'count must be a whole number'),
     (PARTS, BELT % 'part: box, entry: a, station: b', 'speed, spacing required'),
     (PARTS, BELT % (GOOD + ', rate: 3'), 'unknown keys'),
+    (PARTS, BELT % (GOOD + ', placement_error: 0.02'), 'placement_error must be a mapping'),
+    (PARTS, BELT % (GOOD + ', placement_error: {across: -0.02}'), 'across must not be negative'),
+    (PARTS, BELT % (GOOD + ', placement_error: {yaw_deg: much}'), 'yaw_deg must be a number'),
+    (PARTS, BELT % (GOOD + ', placement_error: {seed: 1.5}'), 'seed must be a whole number'),
+    (PARTS, BELT % (GOOD + ', placement_error: {roll_deg: 3}'), 'unknown keys'),
+    (PARTS, BELT.replace('b: {xyz', 'part: {xyz') % 'part: box, entry: a, station: part, '
+     'speed: 0.2, spacing: 0.3', "cannot have a frame named 'part'"),
     (PARTS, '  - {name: box, box: [1, 1, 1]}\n', 'both an object and a part type'),
     (PARTS, '  - {name: box_2, box: [1, 1, 1]}\n', "reserved for the parts of type 'box'"),
     (PARTS + '  - {name: box, box: [1, 1, 1]}\n', '', "part type 'box' is defined twice"),

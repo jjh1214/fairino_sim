@@ -47,48 +47,73 @@ def checked(cell_file=CELL, **kwargs):
 
 
 def cell_with(tmp_path, source=CELL, **conveyor):
-    """Write an example cell with other conveyor settings (mesh paths made absolute)."""
+    """Write an example cell with other conveyor settings (None: leave the key out)."""
     data = yaml.safe_load(open(source))
     for entry in data['parts'] + data['objects']:
         for key in ('visual', 'collision'):
             if key in entry:
                 entry[key] = os.path.abspath(os.path.join(EXAMPLES, entry[key]))
-    next(o for o in data['objects'] if o['name'] == 'conveyor')['conveyor'].update(conveyor)
+    settings = next(o for o in data['objects'] if o['name'] == 'conveyor')['conveyor']
+    settings.update(conveyor)
+    for key in [key for key, value in settings.items() if value is None]:
+        del settings[key]
     path = tmp_path / 'cell.yaml'
     path.write_text(yaml.safe_dump(data, sort_keys=False))
     return str(path)
 
 
+@pytest.fixture(scope='module')
+def exact(tmp_path_factory):
+    """Return the example cell with every part exactly at the station (no placement error)."""
+    return cell_with(tmp_path_factory.mktemp('exact'), placement_error=None)
+
+
+def aligned(cell, count=4):
+    """Return True if the first count parts lie turned alike."""
+    rotations = [cell.object_pose(f'part_{n}')[:3, :3] for n in range(1, count + 1)]
+    return all(np.allclose(r, rotations[0], atol=1e-6) for r in rotations)
+
+
 def test_example_recipe_places_the_first_part_on_the_table(example):
     cell = checked()
     example.recipe(cell)
-    assert [r['status'] for r in cell.reports] == ['OK'] * 11, cell.reports
+    assert [r['status'] for r in cell.reports] == ['OK'] * 12, cell.reports
     place = cell.core.frame_matrix('table/place', cell.state)
     assert np.allclose(cell.object_pose('part_1')[:3, 3], place[:3, 3], atol=1e-6)
     waited = cell.reports[2]
     assert waited['kind'] == 'wait' and waited['duration'] == pytest.approx(0.64, abs=0.01)
-    assert cell.reports[4]['message'] == ('gripped part_1, TCP 0.0 mm from part_1/grasp, '
-                                          'lifting it from conveyor')
+    # the open fingers come down beside the part, then close on its 80 mm sides
+    assert cell.reports[4]['allowed_contacts'] == [] and cell.reports[4]['status'] == 'OK'
+    grip, release = cell.reports[5], cell.reports[9]
+    assert grip['message'] == ('gripped part_1, TCP 0.0 mm from part_1/grasp, fingers closed '
+                               'to 80.0 mm in 0.30 s, lifting it from conveyor')
+    assert grip['duration'] == pytest.approx(0.3) and release['duration'] == pytest.approx(0.3)
+    assert release['message'].endswith('fingers opened in 0.30 s')
+    assert cell.state.fingers == pytest.approx(0.055)          # open again
     # the next move may lift the part off the conveyor, and only that move
-    assert cell.reports[5]['allowed_contacts'] == ['part_1 <-> conveyor']
-    assert cell.reports[6]['allowed_contacts'] == []
+    assert cell.reports[6]['allowed_contacts'] == ['part_1 <-> conveyor']
+    assert cell.reports[7]['allowed_contacts'] == []
     assert cell.cycle_time == pytest.approx(cell.state.time, abs=0.005)   # ms rounding
 
 
 def test_index_cycle_places_four_parts():
     cell = checked()
+    model = cell.core.conveyors.models['conveyor']
+    placements = [model.placement(n) for n in range(1, 5)]      # (along, across, yaw)
+    assert min(abs(p[1]) for p in placements) > 0.003 and min(abs(p[2]) for p in placements) > 0.02
     load_example('index_cycle').recipe(cell)
-    assert all(r['status'] == 'OK' for r in cell.reports) and len(cell.reports) == 38
+    assert all(r['status'] == 'OK' for r in cell.reports) and len(cell.reports) == 42
     place = cell.core.frame_matrix('table/place', cell.state)[:3, 3]
     for number, (x, y) in enumerate([(-0.08, -0.08), (0.08, -0.08), (-0.08, 0.08),
                                      (0.08, 0.08)], 1):
         assert np.allclose(cell.object_pose(f'part_{number}')[:3, 3], place + (x, y, 0),
                            atol=1e-6)
+    assert aligned(cell)                  # turned differently on the belt, alike on the table
     summary = cell.summary()
     assert summary['grips'] == 4
-    assert summary['cycle_time'] == pytest.approx(54.22, abs=0.05)
+    assert summary['cycle_time'] == pytest.approx(59.28, abs=0.05)
     assert summary['waiting'] == pytest.approx(0.64, abs=0.01)
-    assert summary['grip_interval'] == pytest.approx(12.46, abs=0.05)
+    assert summary['grip_interval'] == pytest.approx(13.69, abs=0.05)
     # the conveyor has brought its four parts and stands still
     assert cell.state.belts['conveyor'].fed == 4 and not cell.state.io[READY]
 
@@ -102,16 +127,17 @@ def test_the_check_is_repeatable(example):
     assert runs[0] == runs[1]
 
 
-def test_waiting_at_the_pick_position_is_hit_by_the_arriving_part(example):
-    cell = checked()
+def test_waiting_at_the_pick_position_is_hit_by_the_arriving_part(example, exact):
+    cell = checked(exact)
     cell.move_joints(example.HOME, speed=1.0)
-    cell.move_to('conveyor/station', xyz=(0, 0, example.GRASP_HEIGHT),
-                 rpy_deg=example.AT_CONVEYOR, speed=1.0, name='down too early')
+    # the gripper turned so that its fingers stand along the belt, in the way of the part
+    cell.move_to('conveyor/station', xyz=(0, 0, example.GRASP_HEIGHT), rpy_deg=(180, 0, 90),
+                 speed=1.0, name='down too early')
     report = cell.wait_io(READY)
     assert report['status'] == 'FAILED'
-    assert report['collisions'] == ['tool_link <-> part_1']
+    assert report['collisions'] == ['finger_right <-> part_1']
     assert report['message'].startswith('collision after ')
-    assert report['message'].endswith(' s of waiting: tool_link <-> part_1')
+    assert report['message'].endswith(' s of waiting: finger_right <-> part_1')
 
 
 def test_collision_names_the_bodies_and_stops_the_robot(example):
@@ -119,7 +145,7 @@ def test_collision_names_the_bodies_and_stops_the_robot(example):
     cell.move_joints(example.HOME)
     report = cell.move_to('table/place', xyz=(0, 0, -0.05), rpy_deg=example.AT_TABLE)
     assert report['status'] == 'FAILED'
-    assert 'tool_link <-> table' in report['collisions']
+    assert report['collisions'] == ['finger_left <-> table', 'finger_right <-> table']
     assert 0.5 < report['collision_at'] < 1.0
     assert report['end_joints_deg'] == report['start_joints_deg']   # the move was not done
 
@@ -137,16 +163,18 @@ def test_placing_without_allowed_contact_hits_the_table(example):
     assert report['held_object'] == 'part_1'
 
 
-def test_passing_close_is_a_warning(example):
-    cell = checked()
+def test_passing_close_is_a_warning(example, exact):
+    cell = checked(exact)
     cell.move_joints(example.HOME)
     cell.move_to('conveyor/station', xyz=(0, 0, example.GRASP_HEIGHT + example.APPROACH),
                  rpy_deg=example.AT_CONVEYOR)
     cell.wait_io(READY)
-    report = cell.move_to('conveyor/station', xyz=(0, 0, example.GRASP_HEIGHT - 0.02),
-                          rpy_deg=example.AT_CONVEYOR, allow_contact=['part'])
+    # the finger tips come down to 4 mm above the belt, beside the part
+    report = cell.move_to('conveyor/station', xyz=(0, 0, example.GRASP_HEIGHT - 0.008),
+                          rpy_deg=example.AT_CONVEYOR)
     assert report['status'] == 'WARNING'
-    assert report['closest_object'] == 'conveyor' and report['min_clearance'] < 0.01
+    assert report['closest_object'] == 'conveyor'
+    assert report['min_clearance'] == pytest.approx(0.004, abs=1e-4)
     assert report['message'].startswith(f"{report['min_clearance'] * 1000:.1f} mm from conveyor")
 
 
@@ -215,13 +243,62 @@ def test_an_arc_over_the_table(example):
     assert report['duration'] == pytest.approx(1.55, abs=0.01)    # half circle of r = 0.1 m
 
 
-def test_a_line_into_the_part_collides(example):
-    cell = checked()
+def test_picking_at_the_nominal_station_hits_a_misplaced_part(example):
+    cell = checked()           # part_1 lies 23 mm across the belt from the station, turned
     above_station(cell, example)
     report = cell.move_line('conveyor/station', xyz=(0, 0, example.GRASP_HEIGHT),
-                            rpy_deg=example.AT_CONVEYOR, speed=0.1, name='pick, no contact')
+                            rpy_deg=example.AT_CONVEYOR, speed=0.1, name='pick at the station')
     assert report['status'] == 'FAILED'
-    assert report['collisions'] == ['tool_link <-> part_1'] and report['collision_at'] > 0.5
+    assert report['collisions'] == ['finger_right <-> part_1'] and report['collision_at'] > 0.5
+    # going where the part lies, the fingers come down beside it
+    for xyz in ((0, 0, example.APPROACH), (0, 0, 0)):
+        report = cell.move_line('conveyor/part/grasp', xyz=xyz, rpy_deg=example.AT_CONVEYOR)
+        assert report['status'] == 'OK', report
+    assert cell.grip()['message'].startswith('gripped part_1, TCP 0.0 mm from part_1/grasp')
+
+
+def test_the_fingers_centre_a_part_between_them(example, exact):
+    cell = checked(exact)
+    above_station(cell, example)
+    # 6 mm off the middle of the part, across the belt (the fingers close across it)
+    cell.move_line('conveyor/station', xyz=(0, 0.006, example.GRASP_HEIGHT),
+                   rpy_deg=example.AT_CONVEYOR, speed=0.1)
+    report = cell.grip()
+    assert report['status'] == 'OK'
+    assert report['message'] == ('gripped part_1, TCP 6.0 mm from part_1/grasp, fingers closed '
+                                 'to 80.0 mm in 0.30 s (centring it by 6.0 mm), lifting it '
+                                 'from conveyor')
+    tcp = cell.core.arm.fk(cell.state.joints)
+    grasp = cell.object_pose('part_1') @ transform((0, 0, example.GRASP_HEIGHT))
+    assert np.allclose(grasp[:3, 3], tcp[:3, 3], atol=1e-6)    # pushed to the middle
+    # too far off: the fingers close without touching it
+    cell = checked(exact)
+    above_station(cell, example)
+    for z in (example.GRASP_HEIGHT + example.APPROACH, example.GRASP_HEIGHT):   # beside it
+        assert cell.move_line('conveyor/station', xyz=(0, 0.13, z),
+                              rpy_deg=example.AT_CONVEYOR)['status'] != 'FAILED'
+    report = cell.grip()
+    assert report['status'] == 'FAILED'
+    assert report['message'] == ('nothing to grip: the fingers close without touching part_1: '
+                                 'it is not between them (part_1/grasp is 130 mm from the TCP)')
+
+
+def test_frames_of_the_tool_and_of_the_part_at_the_conveyor(example):
+    cell = checked()
+    cell.move_joints(example.HOME)
+    report = cell.move_to('conveyor/part/grasp')
+    assert report['status'] == 'FAILED'
+    assert report['message'] == ('conveyor/part/grasp: conveyor conveyor has no part ready '
+                                 '(wait for conveyor/part_ready first)')
+    cell.wait_io(READY)
+    before = cell.core.arm.fk(cell.state.joints)
+    report = cell.move_line('tcp', xyz=(0, 0, -0.05), name='back 5 cm')
+    after = cell.core.arm.fk(cell.state.joints)
+    assert report['status'] == 'OK'
+    assert np.allclose(after[:3, 3], before[:3, 3] - 0.05 * before[:3, 2], atol=1e-6)
+    assert np.allclose(after[:3, :3], before[:3, :3], atol=1e-6)    # orientation kept
+    part = cell.core.frame_matrix('conveyor/part', cell.state)
+    assert np.allclose(part, cell.object_pose('part_1'))
 
 
 def test_a_line_through_the_wrist_singularity_fails():
@@ -258,16 +335,50 @@ def test_pick_on_the_move_cycle():
     picks = [r for r in cell.reports if r['kind'] == 'pick']
     assert [r['message'].split(':')[0] for r in picks] == [
         f'picked part_{n} on the move' for n in range(1, 5)]
+    assert all(r['message'].endswith('fingers closed to 80.0 mm in 0.30 s') for r in picks)
     place = cell.core.frame_matrix('table/place', cell.state)[:3, 3]
     for number, (x, y) in enumerate([(-0.08, -0.08), (0.08, -0.08), (-0.08, 0.08),
                                      (0.08, 0.08)], 1):
         assert np.allclose(cell.object_pose(f'part_{number}')[:3, 3], place + (x, y, 0),
                            atol=1e-6)
+    assert aligned(cell)
     summary = cell.summary()
     assert summary['grips'] == 4 and summary['missed'] == 0
-    assert summary['grip_interval'] == pytest.approx(15.0, abs=0.01)   # the belt feeds every 15 s
-    assert summary['cycle_time'] == pytest.approx(66.42, abs=0.05)
-    assert summary['waiting'] == pytest.approx(6.79, abs=0.02)
+    # the belt feeds every 15 s; the parts lie up to 3 cm ahead or behind
+    assert summary['grip_interval'] == pytest.approx(15.19, abs=0.01)
+    assert summary['cycle_time'] == pytest.approx(67.02, abs=0.05)
+    assert summary['waiting'] == pytest.approx(6.18, abs=0.02)
+
+
+def test_a_pick_on_the_move_gives_the_trajectory_the_robot_runs():
+    cell = checked(TRACKING)
+    cell.move_joints(load_example('pick_and_place').HOME)
+    cell.move_to('conveyor/sensor', xyz=(0.3, 0, 0.2), rpy_deg=(180, 0, 180))
+    cell.wait_io(READY)
+    report = new_report('pick', 'pick', True)
+    plan = cell.core.plan_pick_moving(cell.state, 'conveyor', '', transform(
+        (0, 0, 0), np.radians((180, 0, 180))), 0.1, 0.12, 0.3, None, report)
+    times, positions, velocities, _ = plan.trajectory(0.02)
+    assert times[-1] == pytest.approx(plan.path.duration)
+    assert np.allclose(positions[-1], plan.goal, atol=1e-6) and not velocities[-1].any()
+    # the fingers start closing when the TCP follows the part, and touch it at the grip
+    assert plan.close_at == pytest.approx(plan.grip_at - 0.3)
+    assert plan.fingers == pytest.approx(0.04)
+
+
+def test_picking_on_the_move_with_the_fingers_along_the_part_fails():
+    cell = checked(TRACKING)
+    cell.move_joints(load_example('pick_and_place').HOME)
+    cell.move_to('conveyor/sensor', xyz=(0.3, 0, 0.2), rpy_deg=(180, 0, 180))
+    cell.wait_io(READY)
+    # turned 90 degrees, the 110 mm opening is too narrow for the 120 mm length of the part
+    report = cell.pick_moving('conveyor', rpy_deg=(180, 0, 90))
+    assert report['status'] == 'FAILED'
+    assert report['message'].startswith('collision at ')
+    assert report['collisions'][0].startswith('finger_') and 'part_1' in report['collisions'][0]
+    report = cell.pick_moving('conveyor', rpy_deg=(180, 0, 180), grip_time=0.1)
+    assert report['message'] == ('grip_time 0.10 s is shorter than the 0.30 s the fingers need '
+                                 'to close on part_1')
 
 
 def test_parts_too_far_to_catch_are_missed(tmp_path):
@@ -311,16 +422,16 @@ def test_unknown_frame_and_bad_speed(example):
     assert report['message'] == 'speed must be in (0, 1], got 1.5'
 
 
-def test_grasp_miss(example):
-    cell = checked()
+def test_grasp_miss(example, exact):
+    cell = checked(exact)
     cell.move_joints(example.HOME)
     cell.move_to('conveyor/station', xyz=(0, 0, example.GRASP_HEIGHT + example.APPROACH),
                  rpy_deg=example.AT_CONVEYOR)
     cell.wait_io(READY)
     report = cell.grip()
     assert report['status'] == 'FAILED'
-    assert report['message'] == ('nothing to grip: part_1/grasp is 150 mm from the TCP '
-                                 '(tolerance 10 mm)')
+    assert report['message'] == ('nothing to grip: the fingers close without touching part_1: '
+                                 'it is not between them (part_1/grasp is 150 mm from the TCP)')
     assert cell.release()['status'] == 'WARNING'      # nothing to release
 
 

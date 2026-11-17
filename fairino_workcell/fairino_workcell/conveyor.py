@@ -9,8 +9,13 @@ Continuous conveyors keep running. The station frame is a sensor: <conveyor>/par
 while a part that has passed it is still on the belt, to be picked on the move. Parts that
 reach the exit frame leave the cell; they are recorded as missed.
 
+Parts lie on the belt centre line, turned like the station frame, unless the conveyor has a
+placement error: then each part lies a random distance across and along the belt and is turned
+about the vertical. Along the belt, an index conveyor still stops the part at the station (its
+sensor stops the belt); the part only arrives a little earlier or later.
+
 The model is deterministic, so a check can run it in virtual time and predict where every part
-will be during a move or a wait.
+will be during a move or a wait. Placement errors are drawn from the seed and the part number.
 """
 
 from dataclasses import dataclass, field
@@ -30,16 +35,18 @@ class Belt:
     fed: int = 0                                 # parts put on the belt so far
     travel: float = math.inf                     # belt travel since the last part was put on
     missed: list = field(default_factory=list)   # parts that left at the exit (continuous)
+    offsets: dict = field(default_factory=dict)  # part -> (m across the belt, rad about vertical)
 
     def copy(self):
         return Belt([list(item) for item in self.items], self.fed, self.travel,
-                    list(self.missed))
+                    list(self.missed), dict(self.offsets))
 
     def take(self, name):
         """Take a part off the belt; return True if it was on it."""
         for index, (item, _) in enumerate(self.items):
             if item == name:
                 del self.items[index]
+                self.offsets.pop(name, None)
                 return True
         return False
 
@@ -61,6 +68,10 @@ class ConveyorModel:
         self.sensor = (float(np.dot(np.asarray(station[:3, 3]) - self.origin, self.direction))
                        if self.continuous else self.length)
         self.rotation = np.array(station[:3, :3], dtype=float)
+        up = self.rotation[:, 2]                            # the station frame's z: vertical
+        across = np.cross(up, self.direction)
+        self.across = across / max(np.linalg.norm(across), EPS)
+        self.error = spec.placement_error
         self.io = ready_io(name)
 
     def ready(self, belt):
@@ -114,13 +125,30 @@ class ConveyorModel:
         gone = [name for name, distance in belt.items if distance >= self.length - EPS]
         belt.items = [item for item in belt.items if item[0] not in gone]
         belt.missed.extend(gone)
+        for name in gone:
+            belt.offsets.pop(name, None)
         return gone
 
-    def pose(self, distance):
+    def placement(self, number):
+        """
+        Return (along, across, yaw) of the n-th part of the cell: where it lies on the belt.
+
+        along and across are metres from its nominal place, yaw radians about the vertical;
+        all zero without a placement error.
+        """
+        if self.error is None:
+            return 0.0, 0.0, 0.0
+        draw = np.random.default_rng([self.error.seed, number]).uniform(-1.0, 1.0, 3)
+        return (float(draw[0] * self.error.along), float(draw[1] * self.error.across),
+                float(draw[2] * self.error.yaw))
+
+    def pose(self, distance, offset=None):
         """Return the 4x4 world pose of a part at a distance from the entry."""
+        across, yaw = offset if offset is not None else (0.0, 0.0)
         matrix = np.eye(4)
-        matrix[:3, :3] = self.rotation
-        matrix[:3, 3] = self.origin + distance * self.direction
+        c, s = math.cos(yaw), math.sin(yaw)
+        matrix[:3, :3] = self.rotation @ np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+        matrix[:3, 3] = self.origin + distance * self.direction + across * self.across
         return matrix
 
 
@@ -228,10 +256,12 @@ class Conveyors:
                 state.counters[model.part] = number
                 part = part_name(model.part, number)
                 state.parts[part] = model.part
-                belt.items.append([part, 0.0])
+                along, across, yaw = model.placement(number)
+                belt.items.append([part, along])
+                belt.offsets[part] = (across, yaw)
                 belt.fed += 1
                 belt.travel = 0.0
-                state.poses[part] = model.pose(0.0)
+                state.poses[part] = model.pose(along, belt.offsets[part])
                 new.append(part)
         return new
 
@@ -241,7 +271,7 @@ class Conveyors:
             for part in model.leave(belt):
                 state.poses.pop(part, None)
             for part, distance in belt.items:
-                state.poses[part] = model.pose(distance)
+                state.poses[part] = model.pose(distance, belt.offsets.get(part))
             state.io[model.io] = model.ready(belt)
 
     def missed(self, state):
