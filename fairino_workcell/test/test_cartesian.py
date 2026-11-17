@@ -90,3 +90,24 @@ def test_trajectory_follows_the_profile(arm):
     tcp_speed = np.linalg.norm(np.diff([arm.fk(q)[:3, 3] for q in positions], axis=0),
                                axis=1) / np.diff(times)
     assert tcp_speed.max() == pytest.approx(0.1, abs=2e-3)
+
+
+class _Linear:
+    """A profile that lasts a hair over a whole number of 20 ms steps."""
+
+    duration = 1.0000000001
+
+    def at(self, t):
+        return min(max(t / self.duration, 0.0), 1.0), 1.0 / self.duration, 0.0
+
+
+def test_trajectory_times_increase_by_whole_nanoseconds(arm):
+    arm, (lower, upper) = arm
+    start = arm.fk(HOME)
+    path = cartesian.CartesianPath(start, start @ transform((0.0, 0.0, 0.05)))
+    samples = cartesian.follow(arm, path, HOME, lower, upper, STEP)
+    times, _, _ = cartesian.trajectory(arm, path, _Linear(), samples, 0.02)
+    # as the controller receives them: whole seconds and nanoseconds
+    stamps = [(int(t), int((t % 1) * 1e9)) for t in times]
+    assert all(b > a for a, b in zip(stamps, stamps[1:]))
+    assert max(np.diff(times)) <= 0.02 and times[-1] == _Linear.duration

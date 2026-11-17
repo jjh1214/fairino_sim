@@ -176,9 +176,10 @@ def interpolate(samples, s):
 
 def trajectory(arm, path, profile, samples, dt):
     """Return times, joint positions and velocities every dt along the path."""
-    times = np.arange(0.0, profile.duration, dt).tolist() + [profile.duration]
-    if profile.duration <= 0.0:
-        times = [0.0]
+    # evenly spaced, at most dt apart (np.arange would add a point a hair before the end when
+    # the duration is a whole number of steps, which the controller rejects)
+    count = max(1, math.ceil(profile.duration / dt)) if profile.duration > 0.0 else 0
+    times = np.linspace(0.0, profile.duration, count + 1).tolist()
     positions, q = [], samples[0][1]
     for t in times:
         s = profile.at(t)[0]
