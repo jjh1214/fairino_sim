@@ -168,16 +168,23 @@ def convert(path, out_dir, name=None, units=None, origin='keep', collision='mesh
     return Converted(name=name, visual=visual_path, collision=collision_path, info=info)
 
 
-def cell_entry(converted, cell_dir='.'):
-    """Return the cell.yaml objects entry for a converted file."""
+def cell_entry(converted, cell_dir='.', part=False):
+    """
+    Return the cell.yaml entry for a converted file.
+
+    An object entry (objects list) has a pose to set; a part type entry (parts list, for the
+    parts that conveyors bring) has none.
+    """
     def relative(path):
         return os.path.relpath(path, cell_dir)
 
-    return (f'  - name: {converted.name}\n'
-            f'    visual: {relative(converted.visual)}\n'
-            f'    collision: {relative(converted.collision)}\n'
-            f'    units: m\n'
-            f'    pose: {{xyz: [0.0, 0.0, 0.0], rpy: [0.0, 0.0, 0.0]}}\n')
+    entry = (f'  - name: {converted.name}\n'
+             f'    visual: {relative(converted.visual)}\n'
+             f'    collision: {relative(converted.collision)}\n'
+             f'    units: m\n')
+    if part:
+        return entry + '    frames:\n      grasp: {xyz: [0.0, 0.0, 0.0]}\n'
+    return entry + '    pose: {xyz: [0.0, 0.0, 0.0], rpy: [0.0, 0.0, 0.0]}\n'
 
 
 def main(argv=None):
@@ -199,6 +206,9 @@ def main(argv=None):
                         help='triangle budget of the simplified collision mesh (default 3000)')
     parser.add_argument('--cell-dir', default='.',
                         help='directory of cell.yaml; printed paths are relative to it')
+    parser.add_argument('--part', action='store_true',
+                        help='print part type entries (parts list, for conveyors) instead of '
+                             'objects')
     args = parser.parse_args(argv)
     if args.name and len(args.inputs) > 1:
         parser.error('--name works with a single input file')
@@ -212,11 +222,14 @@ def main(argv=None):
             print(f'{path} -> {os.path.dirname(result.visual)}  size {info["size_m"]} m, '
                   f'{info["visual_faces"]} visual / {info["collision_faces"]} collision '
                   'triangles', file=sys.stderr)
-            entries.append(cell_entry(result, args.cell_dir))
+            entries.append(cell_entry(result, args.cell_dir, args.part))
     except CadImportError as exc:
         print(f'import_cad: error: {exc}', file=sys.stderr)
         return 1
-    print('# Add to the objects list of cell.yaml, then set each pose:')
+    if args.part:
+        print('# Add to the parts list of cell.yaml, then set the grasp frame of each part:')
+    else:
+        print('# Add to the objects list of cell.yaml, then set each pose:')
     print(''.join(entries), end='')
     return 0
 

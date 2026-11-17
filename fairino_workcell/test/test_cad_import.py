@@ -3,6 +3,7 @@
 import os
 
 from fairino_workcell import cad_import
+from fairino_workcell.cell import load_cell
 import pytest
 
 try:
@@ -84,6 +85,24 @@ def test_object_names_and_cell_entry(tmp_path):
     assert 'visual: meshes/table/visual.glb' in entry and 'units: m' in entry
 
 
+def test_printed_entries_load_into_a_cell_file(tmp_path):
+    """What import_cad prints, pasted into cell.yaml, gives objects and part types."""
+    table = cad_import.convert(write_box_stl(tmp_path / 'table.stl', [600, 600, 750],
+                                             [0, 0, 375]),
+                               str(tmp_path / 'meshes'), units='mm')
+    part = cad_import.convert(os.path.join(EXAMPLE_CAD, 'part.step'), str(tmp_path / 'meshes'))
+    (tmp_path / 'cell.yaml').write_text(
+        'robot: {model: fairino5_v6}\n'
+        'parts:\n' + cad_import.cell_entry(part, str(tmp_path), part=True)
+        + 'objects:\n' + cad_import.cell_entry(table, str(tmp_path)))
+    cell = load_cell(str(tmp_path / 'cell.yaml'))
+    assert [obj.name for obj in cell.objects] == ['table']
+    assert cell.objects[0].pose.xyz == (0, 0, 0)
+    assert cell.objects[0].geometry.collision == str(tmp_path / 'meshes' / 'table' /
+                                                     'collision.stl')
+    assert cell.parts[0].name == 'part' and cell.parts[0].frame('grasp') is not None
+
+
 def test_command_line(tmp_path, capsys):
     source = write_box_stl(tmp_path / 'plate.stl', [100, 100, 10])
     code = cad_import.main([source, '--units', 'mm', '--out', str(tmp_path / 'm'),
@@ -91,3 +110,7 @@ def test_command_line(tmp_path, capsys):
     assert code == 0
     assert 'name: plate' in capsys.readouterr().out
     assert cad_import.main([source, '--out', str(tmp_path / 'm')]) == 1
+    assert cad_import.main([source, '--units', 'mm', '--out', str(tmp_path / 'm'),
+                            '--part']) == 0
+    printed = capsys.readouterr().out
+    assert 'parts list' in printed and 'grasp:' in printed and 'pose:' not in printed
